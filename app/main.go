@@ -2,64 +2,51 @@ package main
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
+	"io"
 	"os"
-	"strconv"
-	"unicode"
-	// bencode "github.com/jackpal/bencode-go" // Available if you need it!
 )
 
-// Ensures gofmt doesn't remove the "os" encoding/json import (feel free to remove this!)
-var _ = json.Marshal
-
-// Example:
-// - 5:hello -> hello
-// - 10:hello12345 -> hello12345
-func decodeBencode(bencodedString string) (interface{}, error) {
-	if unicode.IsDigit(rune(bencodedString[0])) {
-		var firstColonIndex int
-
-		for i := 0; i < len(bencodedString); i++ {
-			if bencodedString[i] == ':' {
-				firstColonIndex = i
-				break
-			}
-		}
-
-		lengthStr := bencodedString[:firstColonIndex]
-
-		length, err := strconv.Atoi(lengthStr)
-		if err != nil {
-			return "", err
-		}
-
-		return bencodedString[firstColonIndex+1 : firstColonIndex+1+length], nil
-	} else {
-		return "", fmt.Errorf("Only strings are supported at the moment")
+func main() {
+	if err := run(os.Args[1:], os.Stdout); err != nil {
+		fmt.Fprintln(os.Stderr, "error:", err)
+		os.Exit(1)
 	}
 }
 
-func main() {
-	// You can use print statements as follows for debugging, they'll be visible when running tests.
-	fmt.Fprintln(os.Stderr, "Logs from your program will appear here!")
-
-	command := os.Args[1]
-
-	if command == "decode" {
-		// TODO: Uncomment the code below to pass the first stage
-		
-		bencodedValue := os.Args[2]
-		
-		decoded, err := decodeBencode(bencodedValue)
-		if err != nil {
-			fmt.Println(err)
-			return
-		}
-		
-		jsonOutput, _ := json.Marshal(decoded)
-		fmt.Println(string(jsonOutput))
-	} else {
-		fmt.Println("Unknown command: " + command)
-		os.Exit(1)
+// run executes a single CLI command, writing its result to stdout.
+func run(args []string, stdout io.Writer) error {
+	if len(args) == 0 {
+		return errors.New("usage: your_program.sh <command> [arguments]")
 	}
+
+	switch command, args := args[0], args[1:]; command {
+	case "decode":
+		return runDecode(args, stdout)
+	default:
+		return fmt.Errorf("unknown command: %s", command)
+	}
+}
+
+// runDecode implements `decode <bencoded value>`, which prints the bencoded
+// value as JSON.
+func runDecode(args []string, stdout io.Writer) error {
+	if len(args) != 1 {
+		return errors.New("usage: decode <bencoded value>")
+	}
+
+	decoded, err := decodeBencode(args[0])
+	if err != nil {
+		return err
+	}
+
+	return writeJSON(stdout, decoded)
+}
+
+// writeJSON writes value as a single line of compact JSON.
+func writeJSON(w io.Writer, value interface{}) error {
+	encoder := json.NewEncoder(w)
+	encoder.SetEscapeHTML(false) // Print "a<b" rather than "a<b"
+	return encoder.Encode(value)
 }
