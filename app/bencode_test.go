@@ -186,6 +186,96 @@ func TestDecodeBencodeDictInsideList(t *testing.T) {
 	}
 }
 
+func TestDecodeBencodeDictRawValues(t *testing.T) {
+	type dict = map[string]interface{}
+
+	// The nested dictionary reuses the key "a": only the outermost
+	// dictionary's values must be reported.
+	input := "d1:ai1e1:b3:foo1:cl1:xi2ee1:dd1:ai9e1:zdeee"
+
+	got, raw, err := decodeBencodeDict(input)
+	if err != nil {
+		t.Fatalf("decodeBencodeDict(%q) returned error: %v", input, err)
+	}
+
+	want := dict{
+		"a": int64(1),
+		"b": "foo",
+		"c": []interface{}{"x", int64(2)},
+		"d": dict{"a": int64(9), "z": dict{}},
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Errorf("decodeBencodeDict(%q) = %#v, want %#v", input, got, want)
+	}
+
+	wantRaw := map[string]string{
+		"a": "i1e",
+		"b": "3:foo",
+		"c": "l1:xi2ee",
+		"d": "d1:ai9e1:zdee",
+	}
+	if !reflect.DeepEqual(raw, wantRaw) {
+		t.Errorf("decodeBencodeDict(%q) raw values = %#v, want %#v", input, raw, wantRaw)
+	}
+}
+
+// The raw values must be the input's bytes verbatim, even where they aren't
+// what an encoder would produce.
+func TestDecodeBencodeDictRawValuesAreVerbatim(t *testing.T) {
+	input := "d4:infod1:bi2e1:ai1ee5:alphai0ee" // Keys are out of order at both levels
+
+	_, raw, err := decodeBencodeDict(input)
+	if err != nil {
+		t.Fatalf("decodeBencodeDict(%q) returned error: %v", input, err)
+	}
+	if want := "d1:bi2e1:ai1ee"; raw["info"] != want {
+		t.Errorf(`raw["info"] = %q, want %q`, raw["info"], want)
+	}
+	if want := "i0e"; raw["alpha"] != want {
+		t.Errorf(`raw["alpha"] = %q, want %q`, raw["alpha"], want)
+	}
+}
+
+func TestDecodeBencodeDictEmpty(t *testing.T) {
+	got, raw, err := decodeBencodeDict("de")
+	if err != nil {
+		t.Fatalf(`decodeBencodeDict("de") returned error: %v`, err)
+	}
+	if len(got) != 0 || len(raw) != 0 {
+		t.Errorf(`decodeBencodeDict("de") = %#v, %#v, want both empty`, got, raw)
+	}
+}
+
+func TestDecodeBencodeDictErrors(t *testing.T) {
+	tests := []struct {
+		name    string
+		input   string
+		wantErr string
+	}{
+		{"empty input", "", "unexpected end of input"},
+		{"string", "5:hello", "not a dictionary"},
+		{"integer", "i52e", "not a dictionary"},
+		{"list of dictionaries", "ld1:ai1eee", "not a dictionary"},
+		{"unterminated dictionary", "d1:ai1e", "dictionary is not terminated"},
+		{"trailing data", "d1:ai1eejunk", "trailing data"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, raw, err := decodeBencodeDict(tt.input)
+			if err == nil {
+				t.Fatalf("decodeBencodeDict(%q) = %#v, %#v, want an error", tt.input, got, raw)
+			}
+			if !strings.Contains(err.Error(), tt.wantErr) {
+				t.Errorf("decodeBencodeDict(%q) error = %q, want it to contain %q", tt.input, err, tt.wantErr)
+			}
+			if got != nil || raw != nil {
+				t.Errorf("decodeBencodeDict(%q) returned %#v, %#v alongside an error, want nil", tt.input, got, raw)
+			}
+		})
+	}
+}
+
 // Hostile input must produce an error rather than recursing until the stack
 // overflows.
 func TestDecodeBencodeNestingLimit(t *testing.T) {

@@ -60,6 +60,7 @@ func runInfo(args []string, stdout io.Writer) error {
 
 	fmt.Fprintf(stdout, "Tracker URL: %s\n", torrent.Announce)
 	fmt.Fprintf(stdout, "Length: %d\n", torrent.Length)
+	fmt.Fprintf(stdout, "Info Hash: %x\n", torrent.InfoHash)
 	return nil
 }
 

@@ -2,6 +2,8 @@ package main
 
 import (
 	"bytes"
+	"crypto/sha1"
+	"fmt"
 	"strings"
 	"testing"
 )
@@ -72,15 +74,17 @@ func TestRunInfo(t *testing.T) {
 		}
 
 		want := "Tracker URL: http://bittorrent-test-tracker.codecrafters.io/announce\n" +
-			"Length: 92063\n"
+			"Length: 92063\n" +
+			"Info Hash: d69f91e6b2ae4c542468d1073a71d4ea13879a7f\n"
 		if got != want {
 			t.Errorf("info printed:\n%s\nwant:\n%s", got, want)
 		}
 	})
 
 	t.Run("generated torrent", func(t *testing.T) {
+		const info = "d6:lengthi2097152e4:name1:ae"
 		path := writeTempFile(t, "test.torrent", []byte(
-			"d8:announce31:http://tracker.example/announce4:infod6:lengthi2097152e4:name1:aee"))
+			"d8:announce31:http://tracker.example/announce4:info"+info+"e"))
 
 		got, err := runCommand(t, "info", path)
 		if err != nil {
@@ -88,7 +92,8 @@ func TestRunInfo(t *testing.T) {
 		}
 
 		want := "Tracker URL: http://tracker.example/announce\n" +
-			"Length: 2097152\n"
+			"Length: 2097152\n" +
+			fmt.Sprintf("Info Hash: %x\n", sha1.Sum([]byte(info)))
 		if got != want {
 			t.Errorf("info printed:\n%s\nwant:\n%s", got, want)
 		}
@@ -116,7 +121,7 @@ func TestRunErrors(t *testing.T) {
 		{"info without a file", []string{"info"}, "usage: info"},
 		{"info with too many files", []string{"info", "a.torrent", "b.torrent"}, "usage: info"},
 		{"info with a missing file", []string{"info", "does-not-exist.torrent"}, "no such file"},
-		{"info with a file that isn't a torrent", []string{"info", notATorrent}, "not a bencoded dictionary"},
+		{"info with a file that isn't a torrent", []string{"info", notATorrent}, "not a dictionary"},
 	}
 
 	for _, tt := range tests {

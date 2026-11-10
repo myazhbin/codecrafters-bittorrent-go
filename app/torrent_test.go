@@ -1,6 +1,8 @@
 package main
 
 import (
+	"crypto/sha1"
+	"encoding/hex"
 	"os"
 	"path/filepath"
 	"strings"
@@ -34,18 +36,22 @@ func TestLoadTorrentSample(t *testing.T) {
 	if want := int64(92063); torrent.Length != want {
 		t.Errorf("Length = %d, want %d", torrent.Length, want)
 	}
+	if got, want := hex.EncodeToString(torrent.InfoHash[:]), "d69f91e6b2ae4c542468d1073a71d4ea13879a7f"; got != want {
+		t.Errorf("InfoHash = %s, want %s", got, want)
+	}
 }
 
 func TestParseTorrent(t *testing.T) {
-	data := "d" +
-		"8:announce31:http://tracker.example/announce" +
-		"10:created by4:test" +
-		"4:infod" +
+	info := "d" +
 		"6:lengthi12345e" +
 		"4:name8:file.txt" +
 		"12:piece lengthi16384e" +
 		"6:pieces20:" + strings.Repeat("\xab", 20) +
-		"e" +
+		"e"
+	data := "d" +
+		"8:announce31:http://tracker.example/announce" +
+		"10:created by4:test" +
+		"4:info" + info +
 		"e"
 
 	torrent, err := parseTorrent([]byte(data))
@@ -59,6 +65,62 @@ func TestParseTorrent(t *testing.T) {
 	if want := int64(12345); torrent.Length != want {
 		t.Errorf("Length = %d, want %d", torrent.Length, want)
 	}
+	if want := sha1.Sum([]byte(info)); torrent.InfoHash != want {
+		t.Errorf("InfoHash = %x, want %x", torrent.InfoHash, want)
+	}
+}
+
+// The info hash depends on nothing but the info dictionary.
+func TestParseTorrentInfoHashCoversOnlyInfo(t *testing.T) {
+	const info = "d6:lengthi1e4:name1:ae"
+	want := sha1.Sum([]byte(info))
+
+	tests := []struct {
+		name string
+		data string
+	}{
+		{"minimal", "d8:announce3:url4:info" + info + "e"},
+		{"different tracker", "d8:announce9:other-url4:info" + info + "e"},
+		{"keys after info", "d8:announce3:url4:info" + info + "8:url-listl1:aee"},
+		{"keys out of order", "d4:info" + info + "8:announce3:urle"},
+
+		// A nested dictionary's "info" key isn't the torrent's info dictionary.
+		{"nested info before", "d8:announce3:url5:extrad4:infod6:lengthi2eee4:info" + info + "e"},
+		{"nested info after", "d8:announce3:url4:info" + info + "5:otherd4:infod6:lengthi2eeee"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			torrent, err := parseTorrent([]byte(tt.data))
+			if err != nil {
+				t.Fatalf("parseTorrent returned error: %v", err)
+			}
+			if torrent.InfoHash != want {
+				t.Errorf("InfoHash = %x, want %x", torrent.InfoHash, want)
+			}
+		})
+	}
+}
+
+// A torrent whose info dictionary isn't canonically encoded must still get the
+// hash of the bytes in the file, since that's what every other client uses.
+func TestParseTorrentInfoHashOfNonCanonicalInfo(t *testing.T) {
+	const (
+		unsorted = "d4:name1:a6:lengthi1ee" // "name" should come after "length"
+		sorted   = "d6:lengthi1e4:name1:ae"
+	)
+
+	torrent, err := parseTorrent([]byte("d8:announce3:url4:info" + unsorted + "e"))
+	if err != nil {
+		t.Fatalf("parseTorrent returned error: %v", err)
+	}
+
+	if want := sha1.Sum([]byte(unsorted)); torrent.InfoHash != want {
+		t.Errorf("InfoHash = %x, want %x (the hash of the info dictionary as written)", torrent.InfoHash, want)
+	}
+	if reencoded := sha1.Sum([]byte(sorted)); torrent.InfoHash == reencoded {
+		t.Errorf("InfoHash = %x, which is the hash of the re-encoded info dictionary", torrent.InfoHash)
+	}
 }
 
 func TestParseTorrentErrors(t *testing.T) {
@@ -69,7 +131,7 @@ func TestParseTorrentErrors(t *testing.T) {
 	}{
 		{"empty file", "", "invalid torrent"},
 		{"not bencode", "hello", "invalid torrent"},
-		{"not a dictionary", "l8:announcee", "not a bencoded dictionary"},
+		{"not a dictionary", "l8:announcee", "not a dictionary"},
 		{"trailing data", "d8:announce3:url4:infod6:lengthi1eeejunk", "trailing data"},
 		{"missing announce", "d4:infod6:lengthi1eee", `missing "announce"`},
 		{"announce is not a string", "d8:announcei1e4:infod6:lengthi1eee", `"announce" is not a string`},

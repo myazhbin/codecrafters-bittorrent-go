@@ -1,6 +1,7 @@
 package main
 
 import (
+	"errors"
 	"fmt"
 	"math/big"
 	"strconv"
@@ -18,16 +19,30 @@ import (
 //	dict    -> map[string]interface{}
 func decodeBencode(bencoded string) (interface{}, error) {
 	d := bencodeDecoder{data: bencoded}
+	return d.decodeAll()
+}
 
-	value, err := d.decodeValue()
+// decodeBencodeDict decodes a bencoded dictionary. Besides the decoded
+// dictionary, it returns the encoded form of each of the dictionary's values,
+// exactly as it appears in the input.
+//
+// The encoded forms are what hashes of bencoded data (such as a torrent's
+// info hash) must be computed from: re-encoding a decoded value isn't
+// guaranteed to reproduce the original bytes, since the decoder accepts some
+// non-canonical input, such as dictionaries with out-of-order keys.
+func decodeBencodeDict(bencoded string) (dict map[string]interface{}, raw map[string]string, err error) {
+	d := bencodeDecoder{data: bencoded, rawValues: map[string]string{}}
+
+	value, err := d.decodeAll()
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
-	if d.pos != len(d.data) {
-		return nil, d.errorf("unexpected trailing data")
+	dict, ok := value.(map[string]interface{})
+	if !ok {
+		return nil, nil, errors.New("bencode: not a dictionary")
 	}
 
-	return value, nil
+	return dict, d.rawValues, nil
 }
 
 // maxBencodeDepth caps how deeply lists and dictionaries may be nested.
@@ -41,10 +56,26 @@ type bencodeDecoder struct {
 	data  string
 	pos   int
 	depth int // Number of lists and dictionaries enclosing pos
+
+	// rawValues, if non-nil, is filled with the encoded form of each value in
+	// the outermost dictionary.
+	rawValues map[string]string
 }
 
 func (d *bencodeDecoder) errorf(format string, args ...interface{}) error {
 	return fmt.Errorf("bencode: offset %d: %s", d.pos, fmt.Sprintf(format, args...))
+}
+
+// decodeAll decodes a value that must span all of the data.
+func (d *bencodeDecoder) decodeAll() (interface{}, error) {
+	value, err := d.decodeValue()
+	if err != nil {
+		return nil, err
+	}
+	if d.pos != len(d.data) {
+		return nil, d.errorf("unexpected trailing data")
+	}
+	return value, nil
 }
 
 // descend records that decoding is entering a list or dictionary, failing if
@@ -210,11 +241,18 @@ func (d *bencodeDecoder) decodeDict() (map[string]interface{}, error) {
 		if d.pos >= len(d.data) || d.data[d.pos] == 'e' {
 			return nil, d.errorf("dictionary key %q has no value", key)
 		}
+		valueStart := d.pos
 		value, err := d.decodeValue()
 		if err != nil {
 			return nil, err
 		}
 		dict[key] = value
+
+		// A depth of 1 means that this is the outermost dictionary, rather
+		// than one nested inside another value.
+		if d.rawValues != nil && d.depth == 1 {
+			d.rawValues[key] = d.data[valueStart:d.pos]
+		}
 	}
 }
 

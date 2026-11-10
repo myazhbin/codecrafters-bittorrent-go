@@ -1,6 +1,7 @@
 package main
 
 import (
+	"crypto/sha1"
 	"errors"
 	"fmt"
 	"os"
@@ -11,6 +12,10 @@ import (
 type Torrent struct {
 	Announce string // URL of the tracker, which keeps track of the torrent's peers
 	Length   int64  // Size of the file, in bytes
+
+	// InfoHash is the SHA-1 hash of the bencoded info dictionary. It uniquely
+	// identifies the torrent to trackers and peers.
+	InfoHash [sha1.Size]byte
 }
 
 // loadTorrent reads and parses the torrent file at path.
@@ -33,14 +38,12 @@ func loadTorrent(path string) (*Torrent, error) {
 //	announce: URL of the tracker
 //	info:     a dictionary describing the file being shared:
 //	    length: size of the file in bytes
+//
+// The SHA-1 hash of the bencoded info dictionary is the torrent's info hash.
 func parseTorrent(data []byte) (*Torrent, error) {
-	decoded, err := decodeBencode(string(data))
+	metainfo, rawValues, err := decodeBencodeDict(string(data))
 	if err != nil {
 		return nil, fmt.Errorf("invalid torrent: %w", err)
-	}
-	metainfo, ok := decoded.(map[string]interface{})
-	if !ok {
-		return nil, errors.New("invalid torrent: not a bencoded dictionary")
 	}
 
 	announce, err := dictString(metainfo, "announce")
@@ -69,5 +72,11 @@ func parseTorrent(data []byte) (*Torrent, error) {
 	return &Torrent{
 		Announce: announce,
 		Length:   length,
+
+		// The hash covers the info dictionary's bytes exactly as they appear
+		// in the file. That's always what other clients hash, whereas
+		// re-encoding the decoded dictionary would produce different bytes
+		// (and so a different hash) if the file isn't canonically encoded.
+		InfoHash: sha1.Sum([]byte(rawValues["info"])),
 	}, nil
 }
