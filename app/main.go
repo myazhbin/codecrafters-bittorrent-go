@@ -61,6 +61,11 @@ func runInfo(args []string, stdout io.Writer) error {
 	fmt.Fprintf(stdout, "Tracker URL: %s\n", torrent.Announce)
 	fmt.Fprintf(stdout, "Length: %d\n", torrent.Length)
 	fmt.Fprintf(stdout, "Info Hash: %x\n", torrent.InfoHash)
+	fmt.Fprintf(stdout, "Piece Length: %d\n", torrent.PieceLength)
+	fmt.Fprintln(stdout, "Piece Hashes:")
+	for _, hash := range torrent.PieceHashes {
+		fmt.Fprintf(stdout, "%x\n", hash)
+	}
 	return nil
 }
 

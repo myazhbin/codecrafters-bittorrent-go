@@ -75,16 +75,21 @@ func TestRunInfo(t *testing.T) {
 
 		want := "Tracker URL: http://bittorrent-test-tracker.codecrafters.io/announce\n" +
 			"Length: 92063\n" +
-			"Info Hash: d69f91e6b2ae4c542468d1073a71d4ea13879a7f\n"
+			"Info Hash: d69f91e6b2ae4c542468d1073a71d4ea13879a7f\n" +
+			"Piece Length: 32768\n" +
+			"Piece Hashes:\n" +
+			"e876f67a2a8886e8f36b136726c30fa29703022d\n" +
+			"6e2275e604a0766656736e81ff10b55204ad8d35\n" +
+			"f00d937a0213df1982bc8d097227ad9e909acc17\n"
 		if got != want {
 			t.Errorf("info printed:\n%s\nwant:\n%s", got, want)
 		}
 	})
 
 	t.Run("generated torrent", func(t *testing.T) {
-		const info = "d6:lengthi2097152e4:name1:ae"
-		path := writeTempFile(t, "test.torrent", []byte(
-			"d8:announce31:http://tracker.example/announce4:info"+info+"e"))
+		content := testContent(2500)
+		info := testInfoDict(content, 1024)
+		path := writeTempFile(t, "test.torrent", testTorrentFile("http://tracker.example/announce", info))
 
 		got, err := runCommand(t, "info", path)
 		if err != nil {
@@ -92,8 +97,32 @@ func TestRunInfo(t *testing.T) {
 		}
 
 		want := "Tracker URL: http://tracker.example/announce\n" +
-			"Length: 2097152\n" +
-			fmt.Sprintf("Info Hash: %x\n", sha1.Sum([]byte(info)))
+			"Length: 2500\n" +
+			fmt.Sprintf("Info Hash: %x\n", sha1.Sum([]byte(info))) +
+			"Piece Length: 1024\n" +
+			"Piece Hashes:\n" +
+			fmt.Sprintf("%x\n", sha1.Sum(content[:1024])) +
+			fmt.Sprintf("%x\n", sha1.Sum(content[1024:2048])) +
+			fmt.Sprintf("%x\n", sha1.Sum(content[2048:]))
+		if got != want {
+			t.Errorf("info printed:\n%s\nwant:\n%s", got, want)
+		}
+	})
+
+	t.Run("empty file", func(t *testing.T) {
+		info := testInfoDict(nil, 1024)
+		path := writeTempFile(t, "empty.torrent", testTorrentFile("http://tracker.example/announce", info))
+
+		got, err := runCommand(t, "info", path)
+		if err != nil {
+			t.Fatalf("info returned error: %v", err)
+		}
+
+		want := "Tracker URL: http://tracker.example/announce\n" +
+			"Length: 0\n" +
+			fmt.Sprintf("Info Hash: %x\n", sha1.Sum([]byte(info))) +
+			"Piece Length: 1024\n" +
+			"Piece Hashes:\n"
 		if got != want {
 			t.Errorf("info printed:\n%s\nwant:\n%s", got, want)
 		}
