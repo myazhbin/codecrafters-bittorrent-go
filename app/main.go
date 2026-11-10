@@ -26,6 +26,8 @@ func run(args []string, stdout io.Writer) error {
 		return runDecode(args, stdout)
 	case "info":
 		return runInfo(args, stdout)
+	case "peers":
+		return runPeers(args, stdout)
 	default:
 		return fmt.Errorf("unknown command: %s", command)
 	}
@@ -65,6 +67,30 @@ func runInfo(args []string, stdout io.Writer) error {
 	fmt.Fprintln(stdout, "Piece Hashes:")
 	for _, hash := range torrent.PieceHashes {
 		fmt.Fprintf(stdout, "%x\n", hash)
+	}
+	return nil
+}
+
+// runPeers implements `peers <torrent file>`, which asks the torrent's
+// tracker for peers and prints the address of each one.
+func runPeers(args []string, stdout io.Writer) error {
+	if len(args) != 1 {
+		return errors.New("usage: peers <torrent file>")
+	}
+
+	torrent, err := loadTorrent(args[0])
+	if err != nil {
+		return err
+	}
+
+	// Nothing has been downloaded yet, so the whole file is left.
+	peers, err := discoverPeers(torrent.Announce, torrent.InfoHash, newPeerID(), torrent.Length)
+	if err != nil {
+		return err
+	}
+
+	for _, peer := range peers {
+		fmt.Fprintln(stdout, peer)
 	}
 	return nil
 }

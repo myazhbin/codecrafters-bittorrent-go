@@ -129,6 +129,50 @@ func TestRunInfo(t *testing.T) {
 	})
 }
 
+func TestRunPeers(t *testing.T) {
+	content := testContent(2500)
+	info := testInfoDict(content, 1024)
+	tracker := startTestTracker(t, "165.232.41.73:51556", "165.232.38.164:51493", "165.232.35.114:51476")
+	path := writeTempFile(t, "test.torrent", testTorrentFile(tracker.AnnounceURL, info))
+
+	got, err := runCommand(t, "peers", path)
+	if err != nil {
+		t.Fatalf("peers returned error: %v", err)
+	}
+
+	want := "165.232.41.73:51556\n" +
+		"165.232.38.164:51493\n" +
+		"165.232.35.114:51476\n"
+	if got != want {
+		t.Errorf("peers printed:\n%s\nwant:\n%s", got, want)
+	}
+
+	// The tracker must have been asked about this torrent in particular.
+	query := (<-tracker.Requests).URL.Query()
+	if got, want := query.Get("info_hash"), sha1.Sum([]byte(info)); got != string(want[:]) {
+		t.Errorf("info_hash = %x, want %x", got, want)
+	}
+	if got := query.Get("left"); got != "2500" {
+		t.Errorf("left = %q, want %q", got, "2500")
+	}
+	if got := query.Get("peer_id"); len(got) != 20 {
+		t.Errorf("peer_id = %q, want 20 bytes", got)
+	}
+}
+
+func TestRunPeersTrackerFailure(t *testing.T) {
+	announceURL := startTestTrackerFunc(t, 200, "d14:failure reason9:not founde")
+	path := writeTempFile(t, "test.torrent", testTorrentFile(announceURL, minimalInfo))
+
+	got, err := runCommand(t, "peers", path)
+	if err == nil || !strings.Contains(err.Error(), "request failed: not found") {
+		t.Errorf("peers error = %v, want the tracker's failure reason", err)
+	}
+	if got != "" {
+		t.Errorf("peers printed %q despite failing, want no output", got)
+	}
+}
+
 func TestRunErrors(t *testing.T) {
 	notATorrent := writeTempFile(t, "not-a.torrent", []byte("i52e"))
 
@@ -151,6 +195,8 @@ func TestRunErrors(t *testing.T) {
 		{"info with too many files", []string{"info", "a.torrent", "b.torrent"}, "usage: info"},
 		{"info with a missing file", []string{"info", "does-not-exist.torrent"}, "no such file"},
 		{"info with a file that isn't a torrent", []string{"info", notATorrent}, "not a dictionary"},
+		{"peers without a file", []string{"peers"}, "usage: peers"},
+		{"peers with a missing file", []string{"peers", "does-not-exist.torrent"}, "no such file"},
 	}
 
 	for _, tt := range tests {
