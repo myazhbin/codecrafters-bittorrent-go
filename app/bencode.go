@@ -15,6 +15,7 @@ import (
 //	string  -> string (may hold arbitrary bytes, not just valid UTF-8)
 //	integer -> int64, or *big.Int when the value doesn't fit in 64 bits
 //	list    -> []interface{}
+//	dict    -> map[string]interface{}
 func decodeBencode(bencoded string) (interface{}, error) {
 	d := bencodeDecoder{data: bencoded}
 
@@ -29,9 +30,9 @@ func decodeBencode(bencoded string) (interface{}, error) {
 	return value, nil
 }
 
-// maxBencodeDepth caps how deeply lists may be nested. Real-world bencoded
-// data is only a handful of levels deep; the cap stops hostile input (which
-// can arrive from the network) from exhausting the stack.
+// maxBencodeDepth caps how deeply lists and dictionaries may be nested.
+// Real-world bencoded data is only a handful of levels deep; the cap stops
+// hostile input (which can arrive from the network) from exhausting the stack.
 const maxBencodeDepth = 512
 
 // bencodeDecoder is a cursor over bencoded data. Each decode method consumes
@@ -39,11 +40,25 @@ const maxBencodeDepth = 512
 type bencodeDecoder struct {
 	data  string
 	pos   int
-	depth int // Number of lists enclosing pos
+	depth int // Number of lists and dictionaries enclosing pos
 }
 
 func (d *bencodeDecoder) errorf(format string, args ...interface{}) error {
 	return fmt.Errorf("bencode: offset %d: %s", d.pos, fmt.Sprintf(format, args...))
+}
+
+// descend records that decoding is entering a list or dictionary, failing if
+// that would nest too deeply. Each successful call must be paired with ascend.
+func (d *bencodeDecoder) descend() error {
+	if d.depth == maxBencodeDepth {
+		return d.errorf("values are nested more than %d levels deep", maxBencodeDepth)
+	}
+	d.depth++
+	return nil
+}
+
+func (d *bencodeDecoder) ascend() {
+	d.depth--
 }
 
 // decodeValue decodes whichever kind of value starts at the current position.
@@ -59,6 +74,8 @@ func (d *bencodeDecoder) decodeValue() (interface{}, error) {
 		return d.decodeInteger()
 	case c == 'l':
 		return d.decodeList()
+	case c == 'd':
+		return d.decodeDict()
 	default:
 		return nil, d.errorf("unexpected character %q", c)
 	}
@@ -127,11 +144,10 @@ func (d *bencodeDecoder) decodeInteger() (interface{}, error) {
 //
 // Example: l5:helloi52ee -> ["hello", 52]
 func (d *bencodeDecoder) decodeList() ([]interface{}, error) {
-	if d.depth == maxBencodeDepth {
-		return nil, d.errorf("values are nested more than %d levels deep", maxBencodeDepth)
+	if err := d.descend(); err != nil {
+		return nil, err
 	}
-	d.depth++
-	defer func() { d.depth-- }()
+	defer d.ascend()
 
 	d.pos++ // Skips the leading 'l'
 
@@ -150,6 +166,55 @@ func (d *bencodeDecoder) decodeList() ([]interface{}, error) {
 			return nil, err
 		}
 		list = append(list, element)
+	}
+}
+
+// decodeDict decodes a dictionary, which is encoded as
+// d<key1><value1>...<keyN><valueN>e. Keys must be strings.
+//
+// Encoders are required to write the keys in sorted order, but that isn't
+// enforced here: out-of-order keys are harmless, and tolerating them lets
+// slightly malformed data still be read. Duplicate keys, on the other hand,
+// make the value ambiguous and are rejected.
+//
+// Example: d3:foo3:bar5:helloi52ee -> {"foo": "bar", "hello": 52}
+func (d *bencodeDecoder) decodeDict() (map[string]interface{}, error) {
+	if err := d.descend(); err != nil {
+		return nil, err
+	}
+	defer d.ascend()
+
+	d.pos++ // Skips the leading 'd'
+
+	dict := map[string]interface{}{} // Non-nil, so that an empty dictionary is {} rather than null in JSON
+	for {
+		if d.pos >= len(d.data) {
+			return nil, d.errorf("dictionary is not terminated by 'e'")
+		}
+		if d.data[d.pos] == 'e' {
+			d.pos++
+			return dict, nil
+		}
+
+		if !isDigit(d.data[d.pos]) {
+			return nil, d.errorf("dictionary keys must be strings")
+		}
+		key, err := d.decodeString()
+		if err != nil {
+			return nil, err
+		}
+		if _, exists := dict[key]; exists {
+			return nil, d.errorf("duplicate dictionary key %q", key)
+		}
+
+		if d.pos >= len(d.data) || d.data[d.pos] == 'e' {
+			return nil, d.errorf("dictionary key %q has no value", key)
+		}
+		value, err := d.decodeValue()
+		if err != nil {
+			return nil, err
+		}
+		dict[key] = value
 	}
 }
 

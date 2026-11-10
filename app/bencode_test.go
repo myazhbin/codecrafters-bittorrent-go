@@ -123,18 +123,96 @@ func TestDecodeBencodeList(t *testing.T) {
 	}
 }
 
+func TestDecodeBencodeDict(t *testing.T) {
+	type dict = map[string]interface{}
+	type list = []interface{}
+
+	tests := []struct {
+		input string
+		want  dict
+	}{
+		{"d3:foo3:bar5:helloi52ee", dict{"foo": "bar", "hello": int64(52)}},
+		{"de", dict{}},
+		{"d3:foo9:blueberry5:helloi52ee", dict{"foo": "blueberry", "hello": int64(52)}},
+		{"d0:i1ee", dict{"": int64(1)}},
+		{"d1:e1:ee", dict{"e": "e"}}, // Neither "e" is the terminator
+		{"d4:spaml1:a1:bee", dict{"spam": list{"a", "b"}}},
+		{"d1:ad1:bd1:cdeeee", dict{"a": dict{"b": dict{"c": dict{}}}}},
+		{
+			"d10:inner_dictd4:key16:value14:key2i42e8:list_keyl5:item15:item2i3eeee",
+			dict{"inner_dict": dict{
+				"key1":     "value1",
+				"key2":     int64(42),
+				"list_key": list{"item1", "item2", int64(3)},
+			}},
+		},
+		{
+			"d1:ai1e1:b1:x1:cli1ee1:dd1:ei2eee",
+			dict{"a": int64(1), "b": "x", "c": list{int64(1)}, "d": dict{"e": int64(2)}},
+		},
+
+		// Keys that aren't in sorted order are tolerated.
+		{"d5:helloi52e3:foo3:bare", dict{"foo": "bar", "hello": int64(52)}},
+
+		// Keys are arbitrary byte strings.
+		{"d2:\xff\x00i1ee", dict{"\xff\x00": int64(1)}},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.input, func(t *testing.T) {
+			got, err := decodeBencode(tt.input)
+			if err != nil {
+				t.Fatalf("decodeBencode(%q) returned error: %v", tt.input, err)
+			}
+			if !reflect.DeepEqual(got, tt.want) {
+				t.Errorf("decodeBencode(%q) = %#v, want %#v", tt.input, got, tt.want)
+			}
+		})
+	}
+}
+
+func TestDecodeBencodeDictInsideList(t *testing.T) {
+	got, err := decodeBencode("ld1:ai1eed1:bi2eee")
+	if err != nil {
+		t.Fatalf("decodeBencode returned error: %v", err)
+	}
+
+	want := []interface{}{
+		map[string]interface{}{"a": int64(1)},
+		map[string]interface{}{"b": int64(2)},
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Errorf("decodeBencode = %#v, want %#v", got, want)
+	}
+}
+
 // Hostile input must produce an error rather than recursing until the stack
 // overflows.
 func TestDecodeBencodeNestingLimit(t *testing.T) {
-	nested := func(depth int) string {
+	nestedLists := func(depth int) string {
 		return strings.Repeat("l", depth) + strings.Repeat("e", depth)
 	}
-
-	if _, err := decodeBencode(nested(maxBencodeDepth)); err != nil {
-		t.Errorf("decoding %d nested lists returned error: %v", maxBencodeDepth, err)
+	nestedDicts := func(depth int) string {
+		return strings.Repeat("d1:a", depth-1) + "de" + strings.Repeat("e", depth-1)
+	}
+	nestedMixed := func(depth int) string { // Alternates dictionaries and lists
+		return strings.Repeat("d1:al", depth/2) + strings.Repeat("ee", depth/2)
 	}
 
-	if _, err := decodeBencode(nested(maxBencodeDepth + 1)); err == nil {
+	for name, nested := range map[string]func(int) string{
+		"lists":        nestedLists,
+		"dictionaries": nestedDicts,
+		"mixed":        nestedMixed,
+	} {
+		if _, err := decodeBencode(nested(maxBencodeDepth)); err != nil {
+			t.Errorf("decoding %d nested %s returned error: %v", maxBencodeDepth, name, err)
+		}
+		if _, err := decodeBencode(nested(maxBencodeDepth + 2)); err == nil {
+			t.Errorf("decoding %d nested %s succeeded, want an error", maxBencodeDepth+2, name)
+		}
+	}
+
+	if _, err := decodeBencode(nestedLists(maxBencodeDepth + 1)); err == nil {
 		t.Errorf("decoding %d nested lists succeeded, want an error", maxBencodeDepth+1)
 	}
 
@@ -147,6 +225,9 @@ func TestDecodeBencodeNestingLimit(t *testing.T) {
 
 	if _, err := decodeBencode(strings.Repeat("l", 1<<20)); err == nil {
 		t.Error("decoding a million unterminated lists succeeded, want an error")
+	}
+	if _, err := decodeBencode(strings.Repeat("d1:a", 1<<20)); err == nil {
+		t.Error("decoding a million unterminated dictionaries succeeded, want an error")
 	}
 }
 
@@ -184,6 +265,20 @@ func TestDecodeBencodeErrors(t *testing.T) {
 		{"list with a truncated integer", "li52"},
 		{"list followed by trailing data", "lee"},
 		{"list terminator without a list", "e"},
+		{"unterminated empty dictionary", "d"},
+		{"unterminated dictionary", "d3:foo3:bar"},
+		{"dictionary key without a value at end of input", "d3:foo"},
+		{"dictionary key without a value", "d3:fooe"},
+		{"dictionary with a trailing key", "d3:foo3:bar5:helloe"},
+		{"dictionary with an integer key", "di1ei2ee"},
+		{"dictionary with a list key", "dli1eei2ee"},
+		{"dictionary with a dictionary key", "ddei2ee"},
+		{"dictionary with a duplicate key", "d3:fooi1e3:fooi2ee"},
+		{"dictionary with a truncated key", "d5:fooi1ee"},
+		{"dictionary with an invalid value", "d3:fooxe"},
+		{"dictionary with a truncated value", "d3:fooi52"},
+		{"dictionary followed by trailing data", "dee"},
+		{"unterminated dictionary inside a list", "ld3:foo3:bare"},
 	}
 
 	for _, tt := range tests {

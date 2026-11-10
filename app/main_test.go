@@ -39,6 +39,16 @@ func TestRunDecode(t *testing.T) {
 		{"le", "[]"},
 		{"lli4eei5ee", "[[4],5]"},
 		{"lli724e9:pineappleee", `[[724,"pineapple"]]`},
+
+		// Dictionaries
+		{"d3:foo3:bar5:helloi52ee", `{"foo":"bar","hello":52}`},
+		{"de", "{}"},
+		{"d5:helloi52e3:foo3:bare", `{"foo":"bar","hello":52}`}, // Printed with sorted keys
+		{
+			"d10:inner_dictd4:key16:value14:key2i42e8:list_keyl5:item15:item2i3eeee",
+			`{"inner_dict":{"key1":"value1","key2":42,"list_key":["item1","item2",3]}}`,
+		},
+		{"ld1:ai1eelee", `[{"a":1},[]]`},
 	}
 
 	for _, tt := range tests {
@@ -66,6 +76,10 @@ func TestRunErrors(t *testing.T) {
 		{"decode with too many values", []string{"decode", "i1e", "i2e"}, "usage: decode"},
 		{"decode with invalid bencode", []string{"decode", "i52"}, "bencode"},
 		{"decode with an unterminated list", []string{"decode", "l5:hello"}, "list is not terminated"},
+		{"decode with an unterminated dictionary", []string{"decode", "d3:foo3:bar"}, "dictionary is not terminated"},
+		{"decode with a non-string dictionary key", []string{"decode", "di1ei2ee"}, "keys must be strings"},
+		{"decode with a duplicate dictionary key", []string{"decode", "d1:ai1e1:ai2ee"}, `duplicate dictionary key "a"`},
+		{"decode with a valueless dictionary key", []string{"decode", "d1:ae"}, `key "a" has no value`},
 	}
 
 	for _, tt := range tests {
