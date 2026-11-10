@@ -64,7 +64,40 @@ func TestRunDecode(t *testing.T) {
 	}
 }
 
+func TestRunInfo(t *testing.T) {
+	t.Run("sample torrent", func(t *testing.T) {
+		got, err := runCommand(t, "info", sampleTorrentPath)
+		if err != nil {
+			t.Fatalf("info returned error: %v", err)
+		}
+
+		want := "Tracker URL: http://bittorrent-test-tracker.codecrafters.io/announce\n" +
+			"Length: 92063\n"
+		if got != want {
+			t.Errorf("info printed:\n%s\nwant:\n%s", got, want)
+		}
+	})
+
+	t.Run("generated torrent", func(t *testing.T) {
+		path := writeTempFile(t, "test.torrent", []byte(
+			"d8:announce31:http://tracker.example/announce4:infod6:lengthi2097152e4:name1:aee"))
+
+		got, err := runCommand(t, "info", path)
+		if err != nil {
+			t.Fatalf("info returned error: %v", err)
+		}
+
+		want := "Tracker URL: http://tracker.example/announce\n" +
+			"Length: 2097152\n"
+		if got != want {
+			t.Errorf("info printed:\n%s\nwant:\n%s", got, want)
+		}
+	})
+}
+
 func TestRunErrors(t *testing.T) {
+	notATorrent := writeTempFile(t, "not-a.torrent", []byte("i52e"))
+
 	tests := []struct {
 		name    string
 		args    []string
@@ -80,6 +113,10 @@ func TestRunErrors(t *testing.T) {
 		{"decode with a non-string dictionary key", []string{"decode", "di1ei2ee"}, "keys must be strings"},
 		{"decode with a duplicate dictionary key", []string{"decode", "d1:ai1e1:ai2ee"}, `duplicate dictionary key "a"`},
 		{"decode with a valueless dictionary key", []string{"decode", "d1:ae"}, `key "a" has no value`},
+		{"info without a file", []string{"info"}, "usage: info"},
+		{"info with too many files", []string{"info", "a.torrent", "b.torrent"}, "usage: info"},
+		{"info with a missing file", []string{"info", "does-not-exist.torrent"}, "no such file"},
+		{"info with a file that isn't a torrent", []string{"info", notATorrent}, "not a bencoded dictionary"},
 	}
 
 	for _, tt := range tests {

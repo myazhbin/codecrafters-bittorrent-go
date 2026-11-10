@@ -24,6 +24,8 @@ func run(args []string, stdout io.Writer) error {
 	switch command, args := args[0], args[1:]; command {
 	case "decode":
 		return runDecode(args, stdout)
+	case "info":
+		return runInfo(args, stdout)
 	default:
 		return fmt.Errorf("unknown command: %s", command)
 	}
@@ -42,6 +44,23 @@ func runDecode(args []string, stdout io.Writer) error {
 	}
 
 	return writeJSON(stdout, decoded)
+}
+
+// runInfo implements `info <torrent file>`, which prints details about a
+// torrent.
+func runInfo(args []string, stdout io.Writer) error {
+	if len(args) != 1 {
+		return errors.New("usage: info <torrent file>")
+	}
+
+	torrent, err := loadTorrent(args[0])
+	if err != nil {
+		return err
+	}
+
+	fmt.Fprintf(stdout, "Tracker URL: %s\n", torrent.Announce)
+	fmt.Fprintf(stdout, "Length: %d\n", torrent.Length)
+	return nil
 }
 
 // writeJSON writes value as a single line of compact JSON.

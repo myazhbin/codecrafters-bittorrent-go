@@ -218,6 +218,48 @@ func (d *bencodeDecoder) decodeDict() (map[string]interface{}, error) {
 	}
 }
 
+// dictString returns the string stored under key in a decoded dictionary.
+func dictString(dict map[string]interface{}, key string) (string, error) {
+	value, ok := dict[key]
+	if !ok {
+		return "", fmt.Errorf("missing %q", key)
+	}
+	s, ok := value.(string)
+	if !ok {
+		return "", fmt.Errorf("%q is not a string", key)
+	}
+	return s, nil
+}
+
+// dictInt returns the integer stored under key in a decoded dictionary.
+func dictInt(dict map[string]interface{}, key string) (int64, error) {
+	value, ok := dict[key]
+	if !ok {
+		return 0, fmt.Errorf("missing %q", key)
+	}
+	switch n := value.(type) {
+	case int64:
+		return n, nil
+	case *big.Int:
+		return 0, fmt.Errorf("%q is out of range: %s", key, n)
+	default:
+		return 0, fmt.Errorf("%q is not an integer", key)
+	}
+}
+
+// dictDict returns the dictionary stored under key in a decoded dictionary.
+func dictDict(dict map[string]interface{}, key string) (map[string]interface{}, error) {
+	value, ok := dict[key]
+	if !ok {
+		return nil, fmt.Errorf("missing %q", key)
+	}
+	d, ok := value.(map[string]interface{})
+	if !ok {
+		return nil, fmt.Errorf("%q is not a dictionary", key)
+	}
+	return d, nil
+}
+
 func isDigit(c byte) bool {
 	return c >= '0' && c <= '9'
 }
