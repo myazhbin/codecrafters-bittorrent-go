@@ -14,6 +14,7 @@ import (
 //
 //	string  -> string (may hold arbitrary bytes, not just valid UTF-8)
 //	integer -> int64, or *big.Int when the value doesn't fit in 64 bits
+//	list    -> []interface{}
 func decodeBencode(bencoded string) (interface{}, error) {
 	d := bencodeDecoder{data: bencoded}
 
@@ -28,11 +29,17 @@ func decodeBencode(bencoded string) (interface{}, error) {
 	return value, nil
 }
 
+// maxBencodeDepth caps how deeply lists may be nested. Real-world bencoded
+// data is only a handful of levels deep; the cap stops hostile input (which
+// can arrive from the network) from exhausting the stack.
+const maxBencodeDepth = 512
+
 // bencodeDecoder is a cursor over bencoded data. Each decode method consumes
 // exactly one value starting at pos and leaves pos just past it.
 type bencodeDecoder struct {
-	data string
-	pos  int
+	data  string
+	pos   int
+	depth int // Number of lists enclosing pos
 }
 
 func (d *bencodeDecoder) errorf(format string, args ...interface{}) error {
@@ -50,6 +57,8 @@ func (d *bencodeDecoder) decodeValue() (interface{}, error) {
 		return d.decodeString()
 	case c == 'i':
 		return d.decodeInteger()
+	case c == 'l':
+		return d.decodeList()
 	default:
 		return nil, d.errorf("unexpected character %q", c)
 	}
@@ -111,6 +120,37 @@ func (d *bencodeDecoder) decodeInteger() (interface{}, error) {
 	}
 	n, _ := new(big.Int).SetString(number, 10) // Can't fail: number was validated above
 	return n, nil
+}
+
+// decodeList decodes a list, which is encoded as l<bencoded_elements>e, with
+// no separators between the elements.
+//
+// Example: l5:helloi52ee -> ["hello", 52]
+func (d *bencodeDecoder) decodeList() ([]interface{}, error) {
+	if d.depth == maxBencodeDepth {
+		return nil, d.errorf("values are nested more than %d levels deep", maxBencodeDepth)
+	}
+	d.depth++
+	defer func() { d.depth-- }()
+
+	d.pos++ // Skips the leading 'l'
+
+	list := []interface{}{} // Non-nil, so that an empty list is [] rather than null in JSON
+	for {
+		if d.pos >= len(d.data) {
+			return nil, d.errorf("list is not terminated by 'e'")
+		}
+		if d.data[d.pos] == 'e' {
+			d.pos++
+			return list, nil
+		}
+
+		element, err := d.decodeValue()
+		if err != nil {
+			return nil, err
+		}
+		list = append(list, element)
+	}
 }
 
 func isDigit(c byte) bool {

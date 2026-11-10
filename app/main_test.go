@@ -33,6 +33,12 @@ func TestRunDecode(t *testing.T) {
 		{"i0e", "0"},
 		{"i4294967300e", "4294967300"},
 		{"i123456789012345678901234567890e", "123456789012345678901234567890"},
+
+		// Lists
+		{"l5:helloi52ee", `["hello",52]`},
+		{"le", "[]"},
+		{"lli4eei5ee", "[[4],5]"},
+		{"lli724e9:pineappleee", `[[724,"pineapple"]]`},
 	}
 
 	for _, tt := range tests {
@@ -59,6 +65,7 @@ func TestRunErrors(t *testing.T) {
 		{"decode without a value", []string{"decode"}, "usage: decode"},
 		{"decode with too many values", []string{"decode", "i1e", "i2e"}, "usage: decode"},
 		{"decode with invalid bencode", []string{"decode", "i52"}, "bencode"},
+		{"decode with an unterminated list", []string{"decode", "l5:hello"}, "list is not terminated"},
 	}
 
 	for _, tt := range tests {

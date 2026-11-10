@@ -3,6 +3,7 @@ package main
 import (
 	"math/big"
 	"reflect"
+	"strings"
 	"testing"
 )
 
@@ -89,6 +90,66 @@ func TestDecodeBencodeBigInteger(t *testing.T) {
 	}
 }
 
+func TestDecodeBencodeList(t *testing.T) {
+	tests := []struct {
+		input string
+		want  []interface{}
+	}{
+		{"l5:helloi52ee", []interface{}{"hello", int64(52)}},
+		{"le", []interface{}{}},
+		{"li1ei2ei3ee", []interface{}{int64(1), int64(2), int64(3)}},
+		{"l0:e", []interface{}{""}},
+		{"l1:ee", []interface{}{"e"}}, // The first "e" is string contents, not the terminator
+		{"l1:l1:ie", []interface{}{"l", "i"}},
+		{"llee", []interface{}{[]interface{}{}}},
+		{"lli4eei5ee", []interface{}{[]interface{}{int64(4)}, int64(5)}},
+		{"lli724e9:pineappleee", []interface{}{[]interface{}{int64(724), "pineapple"}}},
+		{
+			"l4:spamli-1el3:egg3:hameee",
+			[]interface{}{"spam", []interface{}{int64(-1), []interface{}{"egg", "ham"}}},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.input, func(t *testing.T) {
+			got, err := decodeBencode(tt.input)
+			if err != nil {
+				t.Fatalf("decodeBencode(%q) returned error: %v", tt.input, err)
+			}
+			if !reflect.DeepEqual(got, tt.want) {
+				t.Errorf("decodeBencode(%q) = %#v, want %#v", tt.input, got, tt.want)
+			}
+		})
+	}
+}
+
+// Hostile input must produce an error rather than recursing until the stack
+// overflows.
+func TestDecodeBencodeNestingLimit(t *testing.T) {
+	nested := func(depth int) string {
+		return strings.Repeat("l", depth) + strings.Repeat("e", depth)
+	}
+
+	if _, err := decodeBencode(nested(maxBencodeDepth)); err != nil {
+		t.Errorf("decoding %d nested lists returned error: %v", maxBencodeDepth, err)
+	}
+
+	if _, err := decodeBencode(nested(maxBencodeDepth + 1)); err == nil {
+		t.Errorf("decoding %d nested lists succeeded, want an error", maxBencodeDepth+1)
+	}
+
+	// The depth must be tracked per branch rather than accumulated: many
+	// shallow siblings are fine.
+	siblings := "l" + strings.Repeat("le", 4*maxBencodeDepth) + "e"
+	if _, err := decodeBencode(siblings); err != nil {
+		t.Errorf("decoding %d sibling lists returned error: %v", 4*maxBencodeDepth, err)
+	}
+
+	if _, err := decodeBencode(strings.Repeat("l", 1<<20)); err == nil {
+		t.Error("decoding a million unterminated lists succeeded, want an error")
+	}
+}
+
 func TestDecodeBencodeErrors(t *testing.T) {
 	tests := []struct {
 		name  string
@@ -115,6 +176,14 @@ func TestDecodeBencodeErrors(t *testing.T) {
 		{"integer with letters", "i5x2e"},
 		{"fractional integer", "i5.2e"},
 		{"integer followed by trailing data", "i52ei53e"},
+		{"unterminated empty list", "l"},
+		{"unterminated list", "l5:helloi52e"},
+		{"unterminated nested list", "lli4eei5e"},
+		{"list with an invalid element", "lxe"},
+		{"list with a truncated string", "l5:helle"},
+		{"list with a truncated integer", "li52"},
+		{"list followed by trailing data", "lee"},
+		{"list terminator without a list", "e"},
 	}
 
 	for _, tt := range tests {
