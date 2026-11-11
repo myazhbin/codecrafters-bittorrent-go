@@ -27,6 +27,12 @@ const (
 	ourMetadataID = 1
 )
 
+// The types of the metadata extension's messages. Each message is a bencoded
+// dictionary that gives its type under the key "msg_type".
+const (
+	metadataRequest = 0 // Asks for a piece of the metadata
+)
+
 // extensionMessage returns a message of the extension protocol. Such
 // messages all share a message ID, and say which extension they belong to
 // with the first byte of their payload:
@@ -114,4 +120,25 @@ func (p *peerConn) receiveExtensionHandshake(payload []byte) error {
 func (p *peerConn) metadataID() (id uint8, ok bool) {
 	id, ok = p.extensionIDs[metadataExtension]
 	return id, ok
+}
+
+// requestMetadataPiece asks the peer for a piece of the torrent's metadata.
+// The metadata is the torrent's bencoded info dictionary, and is split into
+// pieces of 16 KiB for transfer.
+//
+// The request is a message of the metadata extension, whose payload is a
+// bencoded dictionary:
+//
+//	{"msg_type": 0, "piece": <index of the piece>}
+func (p *peerConn) requestMetadataPiece(piece int) error {
+	id, ok := p.metadataID()
+	if !ok {
+		return errors.New("peer doesn't support the metadata extension")
+	}
+
+	payload := encodeBencode(map[string]interface{}{
+		"msg_type": metadataRequest,
+		"piece":    piece,
+	})
+	return p.send(extensionMessage(id, payload))
 }

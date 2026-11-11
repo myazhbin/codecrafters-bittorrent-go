@@ -83,9 +83,11 @@ func (s *swarm) discover() ([]netip.AddrPort, error) {
 }
 
 // connect connects to one of the swarm's peers. The peers are tried in turn,
-// in the order that the tracker listed them, until one of them answers and
-// completes a handshake.
-func (s *swarm) connect(ctx context.Context) (*peerConn, error) {
+// in the order that the tracker listed them, until one of them works out:
+// that is, it answers, completes a handshake, and then gets through whatever
+// the given function does with the connection. A peer that doesn't work out
+// is dropped in favor of the next.
+func (s *swarm) connect(ctx context.Context, prepare func(peer *peerConn) error) (*peerConn, error) {
 	peers, err := s.discover()
 	if err != nil {
 		return nil, err
@@ -95,9 +97,12 @@ func (s *swarm) connect(ctx context.Context) (*peerConn, error) {
 	for _, address := range peers {
 		peer, err := dialPeer(ctx, address.String(), s.greeting)
 		if err == nil {
-			return peer, nil
+			if err = prepare(peer); err == nil {
+				return peer, nil
+			}
+			peer.Close()
 		}
 		failures = append(failures, fmt.Errorf("peer %s: %w", address, err))
 	}
-	return nil, fmt.Errorf("no peer could be connected to:\n%w", errors.Join(failures...))
+	return nil, fmt.Errorf("no peer worked out:\n%w", errors.Join(failures...))
 }

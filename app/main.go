@@ -41,6 +41,8 @@ func run(args []string, stdout io.Writer) error {
 		return runMagnetParse(args, stdout)
 	case "magnet_handshake":
 		return runMagnetHandshake(args, stdout)
+	case "magnet_info":
+		return runMagnetInfo(args, stdout)
 	default:
 		return fmt.Errorf("unknown command: %s", command)
 	}
@@ -222,22 +224,51 @@ func runMagnetHandshake(args []string, stdout io.Writer) error {
 		return err
 	}
 
-	peer, err := newMagnetSwarm(link).connect(context.Background())
+	peer, err := newMagnetSwarm(link).connect(context.Background(), func(peer *peerConn) error {
+		if !peer.SupportsExtensions {
+			return nil // The base handshake is as far as things go with this peer
+		}
+		return peer.handshakeExtensions()
+	})
 	if err != nil {
 		return err
 	}
 	defer peer.Close()
 
-	if peer.SupportsExtensions {
-		if err := peer.handshakeExtensions(); err != nil {
-			return err
-		}
-	}
-
 	fmt.Fprintf(stdout, "Peer ID: %x\n", peer.ID)
 	if id, ok := peer.metadataID(); ok {
 		fmt.Fprintf(stdout, "Peer Metadata Extension ID: %d\n", id)
 	}
+	return nil
+}
+
+// runMagnetInfo implements `magnet_info <magnet link>`, which asks a peer
+// for the metadata of the torrent that a magnet link identifies.
+func runMagnetInfo(args []string, stdout io.Writer) error {
+	if len(args) != 1 {
+		return errors.New("usage: magnet_info <magnet link>")
+	}
+
+	link, err := parseMagnetLink(args[0])
+	if err != nil {
+		return err
+	}
+
+	peer, err := newMagnetSwarm(link).connect(context.Background(), func(peer *peerConn) error {
+		if !peer.SupportsExtensions {
+			return errors.New("peer doesn't support protocol extensions")
+		}
+		if err := peer.handshakeExtensions(); err != nil {
+			return err
+		}
+		// For now, the metadata is taken to fit in a single piece.
+		return peer.requestMetadataPiece(0)
+	})
+	if err != nil {
+		return err
+	}
+	defer peer.Close()
+
 	return nil
 }
 

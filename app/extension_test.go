@@ -385,3 +385,84 @@ func TestReceiveExtensionHandshakeUpdates(t *testing.T) {
 		}
 	}
 }
+
+func TestRequestMetadataPiece(t *testing.T) {
+	infoHash := exampleHandshake.InfoHash
+
+	tests := []struct {
+		name       string
+		metadataID int
+		piece      int
+		want       string // The request, as it appears on the wire
+	}{
+		{"first piece", 16, 0, "\x00\x00\x00\x1b" + "\x14" + "\x10" + "d8:msg_typei0e5:piecei0ee"},
+		{"another piece", 16, 3, "\x00\x00\x00\x1b" + "\x14" + "\x10" + "d8:msg_typei0e5:piecei3ee"},
+		{"piece with a longer index", 2, 12, "\x00\x00\x00\x1c" + "\x14" + "\x02" + "d8:msg_typei0e5:piecei12ee"},
+		{"highest extension message ID", 255, 0, "\x00\x00\x00\x1b" + "\x14" + "\xff" + "d8:msg_typei0e5:piecei0ee"},
+		{"same extension message ID as ours", ourMetadataID, 0, "\x00\x00\x00\x1b" + "\x14" + "\x01" + "d8:msg_typei0e5:piecei0ee"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			fake := startTestPeer(t, &testPeer{InfoHash: infoHash, Reserved: extensionsReserved, MetadataID: tt.metadataID})
+			peer := dialWithExtensions(t, fake.Address, infoHash)
+			if err := peer.handshakeExtensions(); err != nil {
+				t.Fatalf("handshakeExtensions returned error: %v", err)
+			}
+
+			if err := peer.requestMetadataPiece(tt.piece); err != nil {
+				t.Fatalf("requestMetadataPiece returned error: %v", err)
+			}
+			peer.Close()
+
+			messages := messagesAfterHangup(t, fake)
+			if len(messages) != 2 {
+				t.Fatalf("the peer received %d messages, want the extension handshake and the request: %+v", len(messages), messages)
+			}
+			if got := messages[1].encode(); string(got) != tt.want {
+				t.Errorf("the peer received the request %q, want %q", got, tt.want)
+			}
+		})
+	}
+}
+
+// The request has to go out with the ID that the peer picked for the metadata
+// extension, so it can't be sent to a peer that hasn't picked one.
+func TestRequestMetadataPieceWithoutSupport(t *testing.T) {
+	infoHash := exampleHandshake.InfoHash
+
+	tests := []struct {
+		name      string
+		peer      *testPeer
+		handshake bool // Whether to go through the extension handshake first
+	}{
+		{"peer doesn't support the metadata extension", &testPeer{OtherExtensions: map[string]interface{}{"ut_pex": 1}}, true},
+		{"peer has turned the metadata extension off", &testPeer{ExtensionHandshake: []byte("d1:md11:ut_metadatai0eee")}, true},
+		{"no extension handshake yet", &testPeer{MetadataID: 16}, false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			tt.peer.InfoHash, tt.peer.Reserved = infoHash, extensionsReserved
+			fake := startTestPeer(t, tt.peer)
+			peer := dialWithExtensions(t, fake.Address, infoHash)
+			if tt.handshake {
+				if err := peer.handshakeExtensions(); err != nil {
+					t.Fatalf("handshakeExtensions returned error: %v", err)
+				}
+			}
+
+			err := peer.requestMetadataPiece(0)
+			if err == nil || !strings.Contains(err.Error(), "peer doesn't support the metadata extension") {
+				t.Errorf("requestMetadataPiece error = %v, want one saying that the extension isn't supported", err)
+			}
+			peer.Close()
+
+			for _, m := range messagesAfterHangup(t, fake) {
+				if m.ID == msgExtended && m.Payload[0] != extensionHandshakeID {
+					t.Errorf("the peer was sent the extension message %q", m.Payload)
+				}
+			}
+		})
+	}
+}

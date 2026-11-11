@@ -413,3 +413,100 @@ func TestRunMagnetHandshakeErrors(t *testing.T) {
 		})
 	}
 }
+
+func TestRunMagnetInfoRequestsMetadata(t *testing.T) {
+	infoHash := exampleHandshake.InfoHash
+	peer := startTestPeer(t, &testPeer{InfoHash: infoHash, Reserved: extensionsReserved, MetadataID: 42})
+	tracker := startTestTracker(t, peer.Address)
+
+	if _, err := runCommand(t, "magnet_info", testMagnetLink(infoHash, tracker.AnnounceURL)); err != nil {
+		t.Fatalf("magnet_info returned error: %v", err)
+	}
+
+	// After the extension handshake, the peer must have been asked for the
+	// first piece of the metadata, in a message sent with the ID that the
+	// peer itself picked for the metadata extension.
+	messages := messagesAfterHangup(t, peer)
+	if len(messages) != 2 {
+		t.Fatalf("the peer received %d messages, want the extension handshake and the metadata request: %+v", len(messages), messages)
+	}
+	if got := messages[0].encode(); string(got) != ourExtensionHandshake {
+		t.Errorf("the peer first received the message %q, want %q", got, ourExtensionHandshake)
+	}
+	want := "\x00\x00\x00\x1b" + "\x14" + "\x2a" + "d8:msg_typei0e5:piecei0ee"
+	if got := messages[1].encode(); string(got) != want {
+		t.Errorf("the peer then received the message %q, want %q", got, want)
+	}
+
+	if ours := <-peer.Handshakes; ours.Reserved != extensionsReserved || ours.InfoHash != infoHash {
+		t.Errorf("the handshake was sent with reserved bytes % x and info hash %x", ours.Reserved, ours.InfoHash)
+	}
+}
+
+// Metadata can only come from a peer that supports the metadata extension, so
+// peers that don't are passed over.
+func TestRunMagnetInfoSkipsPeersWithoutMetadataSupport(t *testing.T) {
+	infoHash := exampleHandshake.InfoHash
+	noExtensions := startTestPeer(t, &testPeer{InfoHash: infoHash})
+	noMetadata := startTestPeer(t, &testPeer{InfoHash: infoHash, Reserved: extensionsReserved})
+	good := startTestPeer(t, &testPeer{InfoHash: infoHash, Reserved: extensionsReserved, MetadataID: 7})
+	tracker := startTestTracker(t, stoppedServerAddress(t), noExtensions.Address, noMetadata.Address, good.Address)
+
+	if _, err := runCommand(t, "magnet_info", testMagnetLink(infoHash, tracker.AnnounceURL)); err != nil {
+		t.Fatalf("magnet_info returned error: %v", err)
+	}
+
+	messages := messagesAfterHangup(t, good)
+	if len(messages) != 2 {
+		t.Fatalf("the peer with metadata support received %d messages, want 2: %+v", len(messages), messages)
+	}
+	if want := "\x07d8:msg_typei0e5:piecei0ee"; string(messages[1].Payload) != want {
+		t.Errorf("the peer with metadata support was sent %q, want %q", messages[1].Payload, want)
+	}
+	if got := messagesAfterHangup(t, noExtensions); len(got) != 0 {
+		t.Errorf("the peer without extension support was sent %d messages, want none: %+v", len(got), got)
+	}
+}
+
+func TestRunMagnetInfoErrors(t *testing.T) {
+	infoHash := exampleHandshake.InfoHash
+	noExtensions := startTestPeer(t, &testPeer{InfoHash: infoHash})
+	noMetadata := startTestPeer(t, &testPeer{InfoHash: infoHash, Reserved: extensionsReserved})
+
+	tests := []struct {
+		name    string
+		args    []string
+		wantErr string
+	}{
+		{"no link", nil, "usage: magnet_info"},
+		{"too many arguments", []string{exampleMagnetLink, "extra"}, "usage: magnet_info"},
+		{"not a magnet link", []string{sampleTorrentPath}, "invalid magnet link"},
+		{"link without a tracker", []string{testMagnetLink(infoHash)}, "there's no tracker to ask for peers"},
+		{"tracker without peers", []string{testMagnetLink(infoHash, startTestTracker(t).AnnounceURL)}, "doesn't know of any peers"},
+		{
+			"peer without extension support",
+			[]string{testMagnetLink(infoHash, startTestTracker(t, noExtensions.Address).AnnounceURL)},
+			"peer " + noExtensions.Address + ": peer doesn't support protocol extensions",
+		},
+		{
+			"peer without metadata support",
+			[]string{testMagnetLink(infoHash, startTestTracker(t, noMetadata.Address).AnnounceURL)},
+			"peer " + noMetadata.Address + ": peer doesn't support the metadata extension",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, err := runCommand(t, append([]string{"magnet_info"}, tt.args...)...)
+			if err == nil {
+				t.Fatalf("magnet_info %q succeeded, want an error containing %q", tt.args, tt.wantErr)
+			}
+			if !strings.Contains(err.Error(), tt.wantErr) {
+				t.Errorf("magnet_info %q error = %q, want it to contain %q", tt.args, err, tt.wantErr)
+			}
+			if got != "" {
+				t.Errorf("magnet_info %q printed %q despite failing, want no output", tt.args, got)
+			}
+		})
+	}
+}

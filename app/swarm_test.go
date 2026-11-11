@@ -2,10 +2,13 @@ package main
 
 import (
 	"context"
+	"errors"
+	"fmt"
 	"net/netip"
 	"reflect"
 	"strings"
 	"testing"
+	"time"
 )
 
 // extensionsReserved holds the reserved bytes of a handshake that announces
@@ -158,6 +161,10 @@ func TestSwarmDiscover(t *testing.T) {
 	})
 }
 
+// anyPeer is for connecting to a swarm's first reachable peer, whichever it
+// is.
+func anyPeer(*peerConn) error { return nil }
+
 func TestSwarmConnect(t *testing.T) {
 	infoHash := exampleHandshake.InfoHash
 	greeting := handshake{Reserved: extensionsReserved, InfoHash: infoHash, PeerID: newPeerID()}
@@ -170,7 +177,7 @@ func TestSwarmConnect(t *testing.T) {
 		tracker := startTestTracker(t, unreachable, otherTorrent.Address, first.Address, second.Address)
 		s := &swarm{trackers: []string{tracker.AnnounceURL}, left: 1, greeting: greeting}
 
-		peer, err := s.connect(context.Background())
+		peer, err := s.connect(context.Background(), anyPeer)
 		if err != nil {
 			t.Fatalf("connect returned error: %v", err)
 		}
@@ -199,14 +206,14 @@ func TestSwarmConnect(t *testing.T) {
 		tracker := startTestTracker(t, unreachable, otherTorrent.Address)
 		s := &swarm{trackers: []string{tracker.AnnounceURL}, left: 1, greeting: greeting}
 
-		peer, err := s.connect(context.Background())
+		peer, err := s.connect(context.Background(), anyPeer)
 		if err == nil {
 			peer.Close()
 			t.Fatal("connect succeeded, want an error")
 		}
 		// The error must say what went wrong with each of the peers.
 		for _, want := range []string{
-			"no peer could be connected to",
+			"no peer worked out",
 			"peer " + unreachable + ": ",
 			"connection refused",
 			"peer " + otherTorrent.Address + ": peer answered for a different torrent",
@@ -217,10 +224,70 @@ func TestSwarmConnect(t *testing.T) {
 		}
 	})
 
+	t.Run("passes over peers that don't work out", func(t *testing.T) {
+		plain := startTestPeer(t, &testPeer{InfoHash: infoHash})
+		extended := startTestPeer(t, &testPeer{InfoHash: infoHash, Reserved: extensionsReserved})
+		tracker := startTestTracker(t, plain.Address, extended.Address)
+		s := &swarm{trackers: []string{tracker.AnnounceURL}, left: 1, greeting: greeting}
+
+		var tried []*peerConn
+		peer, err := s.connect(context.Background(), func(peer *peerConn) error {
+			tried = append(tried, peer)
+			if !peer.SupportsExtensions {
+				return errors.New("extensions are needed")
+			}
+			return nil
+		})
+		if err != nil {
+			t.Fatalf("connect returned error: %v", err)
+		}
+		defer peer.Close()
+
+		if len(tried) != 2 || peer != tried[1] {
+			t.Fatalf("connect tried %d peers and returned %p, want it to return the second of 2", len(tried), peer)
+		}
+		if !peer.SupportsExtensions {
+			t.Error("connect returned the peer that didn't work out")
+		}
+
+		// The peer that didn't work out must have been hung up on.
+		select {
+		case <-plain.Hangups:
+		case <-time.After(10 * time.Second):
+			t.Error("the connection to the peer that didn't work out was left open")
+		}
+	})
+
+	t.Run("no peer works out", func(t *testing.T) {
+		first := startTestPeer(t, &testPeer{InfoHash: infoHash})
+		second := startTestPeer(t, &testPeer{InfoHash: infoHash})
+		tracker := startTestTracker(t, first.Address, second.Address)
+		s := &swarm{trackers: []string{tracker.AnnounceURL}, left: 1, greeting: greeting}
+
+		attempts := 0
+		peer, err := s.connect(context.Background(), func(peer *peerConn) error {
+			attempts++
+			return fmt.Errorf("failure %d", attempts)
+		})
+		if err == nil {
+			peer.Close()
+			t.Fatal("connect succeeded, want an error")
+		}
+		for _, want := range []string{
+			"no peer worked out",
+			"peer " + first.Address + ": failure 1",
+			"peer " + second.Address + ": failure 2",
+		} {
+			if !strings.Contains(err.Error(), want) {
+				t.Errorf("connect error = %q, want it to contain %q", err, want)
+			}
+		}
+	})
+
 	t.Run("no peers to be found", func(t *testing.T) {
 		s := &swarm{trackers: []string{startTestTracker(t).AnnounceURL}, left: 1, greeting: greeting}
 
-		peer, err := s.connect(context.Background())
+		peer, err := s.connect(context.Background(), anyPeer)
 		if err == nil {
 			peer.Close()
 			t.Fatal("connect succeeded, want an error")
