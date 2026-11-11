@@ -227,6 +227,12 @@ func runMagnetHandshake(args []string, stdout io.Writer) error {
 	}
 	defer peer.Close()
 
+	if peer.SupportsExtensions {
+		if err := peer.handshakeExtensions(); err != nil {
+			return err
+		}
+	}
+
 	fmt.Fprintf(stdout, "Peer ID: %x\n", peer.ID)
 	return nil
 }

@@ -3,7 +3,9 @@ package main
 import (
 	"errors"
 	"fmt"
+	"maps"
 	"math/big"
+	"slices"
 	"strconv"
 	"strings"
 )
@@ -253,6 +255,55 @@ func (d *bencodeDecoder) decodeDict() (map[string]interface{}, error) {
 		if d.rawValues != nil && d.depth == 1 {
 			d.rawValues[key] = d.data[valueStart:d.pos]
 		}
+	}
+}
+
+// encodeBencode returns the bencoded form of a value. The value must be made
+// up of the types that decodeBencode produces, with int also accepted for
+// integers. Anything else is a programming error, and makes it panic.
+func encodeBencode(value interface{}) []byte {
+	return appendBencode(nil, value)
+}
+
+// appendBencode appends the bencoded form of a value to a buffer, and returns
+// the extended buffer.
+func appendBencode(encoded []byte, value interface{}) []byte {
+	switch v := value.(type) {
+	case string:
+		encoded = strconv.AppendInt(encoded, int64(len(v)), 10)
+		encoded = append(encoded, ':')
+		return append(encoded, v...)
+
+	case int:
+		return appendBencode(encoded, int64(v))
+
+	case int64:
+		encoded = append(encoded, 'i')
+		encoded = strconv.AppendInt(encoded, v, 10)
+		return append(encoded, 'e')
+
+	case *big.Int:
+		encoded = append(encoded, 'i')
+		encoded = v.Append(encoded, 10)
+		return append(encoded, 'e')
+
+	case []interface{}:
+		encoded = append(encoded, 'l')
+		for _, element := range v {
+			encoded = appendBencode(encoded, element)
+		}
+		return append(encoded, 'e')
+
+	case map[string]interface{}:
+		encoded = append(encoded, 'd')
+		for _, key := range slices.Sorted(maps.Keys(v)) { // Keys must be written in sorted order
+			encoded = appendBencode(encoded, key)
+			encoded = appendBencode(encoded, v[key])
+		}
+		return append(encoded, 'e')
+
+	default:
+		panic(fmt.Sprintf("bencode: can't encode a value of type %T", value))
 	}
 }
 

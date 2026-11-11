@@ -2,6 +2,7 @@ package main
 
 import (
 	"math/big"
+	"os"
 	"reflect"
 	"strings"
 	"testing"
@@ -380,6 +381,123 @@ func TestDecodeBencodeErrors(t *testing.T) {
 			if got != nil {
 				t.Errorf("decodeBencode(%q) returned %#v alongside an error, want nil", tt.input, got)
 			}
+		})
+	}
+}
+
+func TestEncodeBencode(t *testing.T) {
+	type dict = map[string]interface{}
+	type list = []interface{}
+
+	huge, _ := new(big.Int).SetString("-123456789012345678901234567890", 10)
+
+	tests := []struct {
+		name  string
+		value interface{}
+		want  string
+	}{
+		{"string", "hello", "5:hello"},
+		{"empty string", "", "0:"},
+		{"string of arbitrary bytes", "\x00\xff\n", "3:\x00\xff\n"},
+		{"string longer than 9 bytes", "hello12345", "10:hello12345"},
+		{"int", 52, "i52e"},
+		{"int64", int64(4294967300), "i4294967300e"},
+		{"negative integer", -52, "i-52e"},
+		{"zero", 0, "i0e"},
+		{"smallest int64", int64(-9223372036854775808), "i-9223372036854775808e"},
+		{"integer beyond int64", huge, "i-123456789012345678901234567890e"},
+		{"list", list{"hello", 52}, "l5:helloi52ee"},
+		{"empty list", list{}, "le"},
+		{"nil list", list(nil), "le"},
+		{"nested lists", list{list{4}, 5}, "lli4eei5ee"},
+		{"dictionary", dict{"foo": "bar", "hello": 52}, "d3:foo3:bar5:helloi52ee"},
+		{"empty dictionary", dict{}, "de"},
+		{"nil dictionary", dict(nil), "de"},
+		{
+			"dictionary keys are sorted as raw bytes",
+			dict{"b": 1, "B": 2, "a": 3, "aa": 4, "": 5, "\xff": 6, "a\x00": 7},
+			"d0:i5e1:Bi2e1:ai3e2:a\x00i7e2:aai4e1:bi1e1:\xffi6ee",
+		},
+		{
+			"nested dictionaries and lists",
+			dict{"inner_dict": dict{"key1": "value1", "key2": 42, "list_key": list{"item1", "item2", 3}}},
+			"d10:inner_dictd4:key16:value14:key2i42e8:list_keyl5:item15:item2i3eeee",
+		},
+		{"extension handshake", dict{"m": dict{"ut_metadata": 16}}, "d1:md11:ut_metadatai16eee"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := encodeBencode(tt.value); string(got) != tt.want {
+				t.Errorf("encodeBencode(%#v) = %q, want %q", tt.value, got, tt.want)
+			}
+		})
+	}
+}
+
+// Decoding canonically encoded data and encoding it again gives back the
+// very same bytes.
+func TestEncodeBencodeRoundTrip(t *testing.T) {
+	sample, err := os.ReadFile(sampleTorrentPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	inputs := []string{
+		"5:hello",
+		"0:",
+		"i52e",
+		"i-52e",
+		"i0e",
+		"i123456789012345678901234567890e",
+		"le",
+		"de",
+		"l5:helloi52ee",
+		"lli4eei5ee",
+		"d3:foo3:bar5:helloi52ee",
+		"d10:inner_dictd4:key16:value14:key2i42e8:list_keyl5:item15:item2i3eeee",
+		"d1:ad1:bd1:cdeeee",
+		"d2:\xff\x00i1ee",
+		announceResponse("\x7f\x00\x00\x01\x1a\xe1"),
+		string(sample),
+	}
+
+	for _, input := range inputs {
+		decoded, err := decodeBencode(input)
+		if err != nil {
+			t.Fatalf("decodeBencode(%q) returned error: %v", input, err)
+		}
+		if got := encodeBencode(decoded); string(got) != input {
+			t.Errorf("encodeBencode(decodeBencode(%q)) = %q", input, got)
+		}
+	}
+}
+
+func TestEncodeBencodeUnsupportedTypes(t *testing.T) {
+	tests := []struct {
+		name  string
+		value interface{}
+	}{
+		{"nil", nil},
+		{"float", 1.5},
+		{"bool", true},
+		{"byte slice", []byte("hello")},
+		{"unsigned integer", uint(1)},
+		{"list of strings", []string{"a"}},
+		{"dictionary of strings", map[string]string{"a": "b"}},
+		{"struct", struct{}{}},
+		{"unsupported value in a list", []interface{}{"a", 1.5}},
+		{"unsupported value in a dictionary", map[string]interface{}{"a": nil}},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			defer func() {
+				if recover() == nil {
+					t.Errorf("encodeBencode(%#v) didn't panic", tt.value)
+				}
+			}()
+			encodeBencode(tt.value)
 		})
 	}
 }

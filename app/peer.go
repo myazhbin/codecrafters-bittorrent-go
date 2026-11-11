@@ -130,6 +130,8 @@ const (
 	msgBitfield   messageID = 5 // The pieces that the sender has, as one bit per piece
 	msgRequest    messageID = 6 // Asks for a block of a piece: <index><begin><length>
 	msgPiece      messageID = 7 // A block of a piece: <index><begin><data>
+
+	msgExtended messageID = 20 // A message of the extension protocol: <extension message ID><payload>
 )
 
 // message is one of the messages that peers exchange after their handshakes.

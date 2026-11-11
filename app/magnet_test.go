@@ -257,20 +257,44 @@ func TestRunMagnetHandshake(t *testing.T) {
 	if got := query.Get("compact"); got != "1" {
 		t.Errorf("compact = %q, want %q", got, "1")
 	}
+
+	// As the peer supports extensions, it must have been sent an extension
+	// handshake that lists the metadata extension, and nothing else.
+	messages := messagesAfterHangup(t, peer)
+	if len(messages) != 1 {
+		t.Fatalf("the peer received %d messages, want just the extension handshake: %+v", len(messages), messages)
+	}
+	if got := messages[0].encode(); string(got) != ourExtensionHandshake {
+		t.Errorf("the peer received the message %q, want %q", got, ourExtensionHandshake)
+	}
 }
 
-// A peer that doesn't support extensions can still be shaken hands with.
+// A peer that doesn't support extensions can still be shaken hands with, but
+// it mustn't be sent an extension handshake: it wouldn't know what to make of
+// one.
 func TestRunMagnetHandshakeWithPeerWithoutExtensions(t *testing.T) {
 	infoHash := exampleHandshake.InfoHash
-	peer := startTestPeer(t, &testPeer{InfoHash: infoHash})
-	tracker := startTestTracker(t, peer.Address)
 
-	got, err := runCommand(t, "magnet_handshake", testMagnetLink(infoHash, tracker.AnnounceURL))
-	if err != nil {
-		t.Fatalf("magnet_handshake returned error: %v", err)
-	}
-	if want := "Peer ID: 0102030405060708090a0b0c0d0e0f1011121314\n"; got != want {
-		t.Errorf("magnet_handshake printed %q, want %q", got, want)
+	for name, reserved := range map[string][8]byte{
+		"no reserved bits set":    {},
+		"other reserved bits set": {0xff, 0xff, 0xff, 0xff, 0xff, 0xef, 0xff, 0xff},
+	} {
+		t.Run(name, func(t *testing.T) {
+			peer := startTestPeer(t, &testPeer{InfoHash: infoHash, Reserved: reserved})
+			tracker := startTestTracker(t, peer.Address)
+
+			got, err := runCommand(t, "magnet_handshake", testMagnetLink(infoHash, tracker.AnnounceURL))
+			if err != nil {
+				t.Fatalf("magnet_handshake returned error: %v", err)
+			}
+			if want := "Peer ID: 0102030405060708090a0b0c0d0e0f1011121314\n"; got != want {
+				t.Errorf("magnet_handshake printed %q, want %q", got, want)
+			}
+
+			if messages := messagesAfterHangup(t, peer); len(messages) != 0 {
+				t.Errorf("the peer received %d messages after the handshake, want none: %+v", len(messages), messages)
+			}
+		})
 	}
 }
 

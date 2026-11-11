@@ -144,6 +144,14 @@ type testPeer struct {
 	// Requests receives each block request that clients send.
 	Requests chan blockRequest
 
+	// Messages receives every message that clients send after their
+	// handshakes, block requests included.
+	Messages chan message
+
+	// Hangups receives a value each time that a connection with a client
+	// ends. By then, everything that the client sent has been recorded.
+	Hangups chan struct{}
+
 	// PipelineOverflowed records whether a client ever had more requests
 	// outstanding than it's supposed to. It's only tracked if
 	// RequireFullPipeline is set.
@@ -157,12 +165,21 @@ func startTestPeer(t *testing.T, peer *testPeer) *testPeer {
 
 	peer.Handshakes = make(chan handshake, 64)
 	peer.Requests = make(chan blockRequest, 4096)
+	peer.Messages = make(chan message, 4096)
+	peer.Hangups = make(chan struct{}, 64)
 	peer.Address = startTestServer(t, peer.serve)
 	return peer
 }
 
 // serve talks to a client that connected to the peer.
 func (p *testPeer) serve(conn net.Conn) {
+	defer func() {
+		select {
+		case p.Hangups <- struct{}{}:
+		default:
+		}
+	}()
+
 	theirs, err := readHandshake(conn)
 	if err != nil {
 		return
@@ -200,6 +217,10 @@ func (p *testPeer) serve(conn net.Conn) {
 		m, err := readMessage(reader)
 		if err != nil {
 			return // The client hung up
+		}
+		select {
+		case p.Messages <- m:
+		default:
 		}
 
 		switch m.ID {
