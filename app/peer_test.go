@@ -3,6 +3,7 @@ package main
 import (
 	"bufio"
 	"bytes"
+	"context"
 	"encoding/binary"
 	"errors"
 	"io"
@@ -64,10 +65,17 @@ func stoppedServerAddress(t *testing.T) string {
 // the test, so that tests of unresponsive peers finish quickly.
 func shortenTimeout(t *testing.T, timeout *time.Duration) {
 	t.Helper()
+	setDuration(t, timeout, 200*time.Millisecond)
+}
 
-	original := *timeout
-	*timeout = 200 * time.Millisecond
-	t.Cleanup(func() { *timeout = original })
+// setDuration sets a duration variable to the given value for the duration of
+// the test.
+func setDuration(t *testing.T, variable *time.Duration, value time.Duration) {
+	t.Helper()
+
+	original := *variable
+	*variable = value
+	t.Cleanup(func() { *variable = original })
 }
 
 // blockRequest is the payload of a request message: a block of a piece that a
@@ -355,7 +363,7 @@ func newTestTorrent(t *testing.T, content []byte, pieceLength int) *Torrent {
 func dialTestPeer(t *testing.T, peer *testPeer) *peerConn {
 	t.Helper()
 
-	conn, err := dialPeer(peer.Address, peer.InfoHash, newPeerID())
+	conn, err := dialPeer(context.Background(), peer.Address, peer.InfoHash, newPeerID())
 	if err != nil {
 		t.Fatalf("dialPeer returned error: %v", err)
 	}
@@ -453,7 +461,7 @@ func TestDialPeer(t *testing.T) {
 		io.Copy(io.Discard, conn)
 	})
 
-	peer, err := dialPeer(address, infoHash, ourID)
+	peer, err := dialPeer(context.Background(), address, infoHash, ourID)
 	if err != nil {
 		t.Fatalf("dialPeer returned error: %v", err)
 	}
@@ -542,7 +550,7 @@ func TestDialPeerErrors(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			peer, err := dialPeer(tt.address, infoHash, newPeerID())
+			peer, err := dialPeer(context.Background(), tt.address, infoHash, newPeerID())
 			if err == nil {
 				peer.Close()
 				t.Fatalf("dialPeer succeeded, want an error containing %q", tt.wantErr)
@@ -562,7 +570,7 @@ func TestDialPeerHandshakeTimeout(t *testing.T) {
 	address := startTestServer(t, func(conn net.Conn) { io.Copy(io.Discard, conn) })
 
 	start := time.Now()
-	_, err := dialPeer(address, [20]byte{}, newPeerID())
+	_, err := dialPeer(context.Background(), address, [20]byte{}, newPeerID())
 	elapsed := time.Since(start)
 
 	if !errors.Is(err, os.ErrDeadlineExceeded) {
@@ -590,7 +598,7 @@ func TestDialPeerClearsHandshakeDeadline(t *testing.T) {
 		io.Copy(io.Discard, conn)
 	})
 
-	peer, err := dialPeer(address, infoHash, newPeerID())
+	peer, err := dialPeer(context.Background(), address, infoHash, newPeerID())
 	if err != nil {
 		t.Fatalf("dialPeer returned error: %v", err)
 	}
@@ -605,12 +613,101 @@ func TestDialPeerClearsHandshakeDeadline(t *testing.T) {
 	}
 }
 
+func TestDialPeerWithCancelledContext(t *testing.T) {
+	infoHash := exampleHandshake.InfoHash
+	fake := startTestPeer(t, &testPeer{InfoHash: infoHash})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	peer, err := dialPeer(ctx, fake.Address, infoHash, newPeerID())
+	if err == nil {
+		peer.Close()
+		t.Fatal("dialPeer succeeded, want an error")
+	}
+	if !errors.Is(err, context.Canceled) {
+		t.Errorf("dialPeer error = %v, want one saying that the context was cancelled", err)
+	}
+}
+
+// Cancelling the context must interrupt whatever is waiting on the peer,
+// without the wait having to time out first.
+func TestCancellingContextInterruptsPeer(t *testing.T) {
+	content := testContent(1000)
+	torrent := newTestTorrent(t, content, 1000)
+
+	t.Run("during the handshake", func(t *testing.T) {
+		silent := startTestServer(t, func(conn net.Conn) { io.Copy(io.Discard, conn) })
+
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+		time.AfterFunc(50*time.Millisecond, cancel)
+
+		start := time.Now()
+		peer, err := dialPeer(ctx, silent, torrent.InfoHash, newPeerID())
+		if err == nil {
+			peer.Close()
+			t.Fatal("dialPeer succeeded, want an error")
+		}
+		if elapsed := time.Since(start); elapsed > peerHandshakeTimeout/2 {
+			t.Errorf("dialPeer took %v to fail, want it to fail as soon as the context was cancelled", elapsed)
+		}
+	})
+
+	t.Run("during a download", func(t *testing.T) {
+		choker := startTestPeer(t, &testPeer{
+			InfoHash:     torrent.InfoHash,
+			Content:      content,
+			PieceLength:  1000,
+			NeverUnchoke: true,
+		})
+
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+		peer, err := dialPeer(ctx, choker.Address, torrent.InfoHash, newPeerID())
+		if err != nil {
+			t.Fatalf("dialPeer returned error: %v", err)
+		}
+		defer peer.Close()
+		time.AfterFunc(50*time.Millisecond, cancel)
+
+		start := time.Now()
+		if _, err := peer.downloadPiece(torrent, 0); err == nil {
+			t.Fatal("downloadPiece succeeded, want an error")
+		}
+		if elapsed := time.Since(start); elapsed > peerMessageTimeout/2 {
+			t.Errorf("downloadPiece took %v to fail, want it to fail as soon as the context was cancelled", elapsed)
+		}
+	})
+}
+
+// Closing a connection ends its tie to the context that it was dialed with:
+// cancelling the context afterwards must not disturb anything.
+func TestClosedPeerIgnoresContext(t *testing.T) {
+	infoHash := exampleHandshake.InfoHash
+	fake := startTestPeer(t, &testPeer{InfoHash: infoHash})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	peer, err := dialPeer(ctx, fake.Address, infoHash, newPeerID())
+	if err != nil {
+		t.Fatalf("dialPeer returned error: %v", err)
+	}
+
+	if err := peer.Close(); err != nil {
+		t.Errorf("Close returned error: %v", err)
+	}
+	if stillWatching := peer.stopWatchingContext(); stillWatching {
+		t.Error("the connection was still watching its context after being closed")
+	}
+	cancel()
+}
+
 func TestTestPeerRecordsHandshakes(t *testing.T) {
 	infoHash := exampleHandshake.InfoHash
 	ourID := newPeerID()
 	fake := startTestPeer(t, &testPeer{InfoHash: infoHash})
 
-	peer, err := dialPeer(fake.Address, infoHash, ourID)
+	peer, err := dialPeer(context.Background(), fake.Address, infoHash, ourID)
 	if err != nil {
 		t.Fatalf("dialPeer returned error: %v", err)
 	}
@@ -1254,7 +1351,7 @@ func TestDownloadPieceFromUncooperativePeer(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			peer, err := dialPeer(tt.address, torrent.InfoHash, newPeerID())
+			peer, err := dialPeer(context.Background(), tt.address, torrent.InfoHash, newPeerID())
 			if err != nil {
 				t.Fatalf("dialPeer returned error: %v", err)
 			}
@@ -1295,7 +1392,7 @@ func TestDownloadPieceToleratesDuplicateBlocks(t *testing.T) {
 		io.Copy(io.Discard, conn)
 	})
 
-	peer, err := dialPeer(address, torrent.InfoHash, newPeerID())
+	peer, err := dialPeer(context.Background(), address, torrent.InfoHash, newPeerID())
 	if err != nil {
 		t.Fatalf("dialPeer returned error: %v", err)
 	}

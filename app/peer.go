@@ -2,6 +2,7 @@ package main
 
 import (
 	"bufio"
+	"context"
 	"crypto/sha1"
 	"encoding/binary"
 	"errors"
@@ -185,28 +186,40 @@ type peerConn struct {
 	// bitfield records which pieces the peer has, going by what it has told
 	// us. The most significant bit of the first byte stands for piece 0.
 	bitfield []byte
+
+	// stopWatchingContext ends the arrangement by which the connection gets
+	// closed when the context that it was dialed with is cancelled.
+	stopWatchingContext func() bool
 }
 
 // dialPeer connects to the peer at address (in "host:port" form) and
 // exchanges handshakes with it for the torrent identified by infoHash. peerID
 // is the ID that this client identifies itself with.
-func dialPeer(address string, infoHash, peerID [20]byte) (*peerConn, error) {
-	conn, err := net.DialTimeout("tcp", address, peerDialTimeout)
+//
+// Cancelling the context closes the connection, even after dialPeer has
+// returned. This makes anything that's blocked on the connection fail
+// promptly, rather than when its timeout runs out.
+func dialPeer(ctx context.Context, address string, infoHash, peerID [20]byte) (*peerConn, error) {
+	dialer := net.Dialer{Timeout: peerDialTimeout}
+	conn, err := dialer.DialContext(ctx, "tcp", address)
 	if err != nil {
 		return nil, err
 	}
+	stopWatchingContext := context.AfterFunc(ctx, func() { conn.Close() })
 
 	theirs, err := exchangeHandshakes(conn, handshake{InfoHash: infoHash, PeerID: peerID})
 	if err != nil {
+		stopWatchingContext()
 		conn.Close()
 		return nil, fmt.Errorf("handshake with peer %s: %w", address, err)
 	}
 
 	return &peerConn{
-		conn:   conn,
-		reader: bufio.NewReader(conn),
-		ID:     theirs.PeerID,
-		choked: true,
+		conn:                conn,
+		reader:              bufio.NewReader(conn),
+		ID:                  theirs.PeerID,
+		choked:              true,
+		stopWatchingContext: stopWatchingContext,
 	}, nil
 }
 
@@ -232,6 +245,7 @@ func exchangeHandshakes(conn net.Conn, ours handshake) (handshake, error) {
 
 // Close closes the connection to the peer.
 func (p *peerConn) Close() error {
+	p.stopWatchingContext()
 	return p.conn.Close()
 }
 
