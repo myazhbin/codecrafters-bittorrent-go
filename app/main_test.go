@@ -176,7 +176,7 @@ func TestRunPeersTrackerFailure(t *testing.T) {
 func TestRunHandshake(t *testing.T) {
 	info := testInfoDict(testContent(100), 32)
 	infoHash := sha1.Sum([]byte(info))
-	peer := startTestPeer(t, infoHash)
+	peer := startTestPeer(t, &testPeer{InfoHash: infoHash})
 	path := writeTempFile(t, "test.torrent", testTorrentFile("http://tracker.example/announce", info))
 
 	got, err := runCommand(t, "handshake", path, peer.Address)
@@ -199,7 +199,7 @@ func TestRunHandshake(t *testing.T) {
 }
 
 func TestRunHandshakeWithWrongTorrent(t *testing.T) {
-	peer := startTestPeer(t, [20]byte{0xaa})
+	peer := startTestPeer(t, &testPeer{InfoHash: [20]byte{0xaa}})
 	path := writeTempFile(t, "test.torrent", testTorrentFile("http://tracker.example/announce", minimalInfo))
 
 	got, err := runCommand(t, "handshake", path, peer.Address)

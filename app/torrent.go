@@ -26,6 +26,15 @@ type Torrent struct {
 	PieceHashes [][sha1.Size]byte
 }
 
+// pieceSize returns the size in bytes of the piece with the given index.
+func (t *Torrent) pieceSize(index int) int64 {
+	if index == len(t.PieceHashes)-1 {
+		// The last piece holds whatever the pieces before it leave over.
+		return t.Length - int64(index)*t.PieceLength
+	}
+	return t.PieceLength
+}
+
 // loadTorrent reads and parses the torrent file at path.
 func loadTorrent(path string) (*Torrent, error) {
 	data, err := os.ReadFile(path)

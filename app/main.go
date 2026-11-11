@@ -3,9 +3,11 @@ package main
 import (
 	"encoding/json"
 	"errors"
+	"flag"
 	"fmt"
 	"io"
 	"os"
+	"strconv"
 )
 
 func main() {
@@ -30,6 +32,8 @@ func run(args []string, stdout io.Writer) error {
 		return runPeers(args, stdout)
 	case "handshake":
 		return runHandshake(args, stdout)
+	case "download_piece":
+		return runDownloadPiece(args, stdout)
 	default:
 		return fmt.Errorf("unknown command: %s", command)
 	}
@@ -116,6 +120,42 @@ func runHandshake(args []string, stdout io.Writer) error {
 	defer peer.Close()
 
 	fmt.Fprintf(stdout, "Peer ID: %x\n", peer.ID)
+	return nil
+}
+
+// runDownloadPiece implements
+// `download_piece -o <output file> <torrent file> <piece index>`, which
+// downloads a single piece of a torrent and saves it to a file.
+func runDownloadPiece(args []string, stdout io.Writer) error {
+	const usage = "usage: download_piece -o <output file> <torrent file> <piece index>"
+
+	flags := flag.NewFlagSet("download_piece", flag.ContinueOnError)
+	flags.SetOutput(io.Discard) // Errors are reported by returning them instead
+	outputPath := flags.String("o", "", "file to save the piece to")
+	if err := flags.Parse(args); err != nil || flags.NArg() != 2 || *outputPath == "" {
+		return errors.New(usage)
+	}
+
+	torrent, err := loadTorrent(flags.Arg(0))
+	if err != nil {
+		return err
+	}
+
+	index, err := strconv.Atoi(flags.Arg(1))
+	if err != nil || index < 0 || index >= len(torrent.PieceHashes) {
+		return fmt.Errorf("invalid piece index %q: the torrent has %d pieces, numbered from 0",
+			flags.Arg(1), len(torrent.PieceHashes))
+	}
+
+	piece, err := downloadPiece(torrent, index)
+	if err != nil {
+		return err
+	}
+	if err := os.WriteFile(*outputPath, piece, 0o644); err != nil {
+		return err
+	}
+
+	fmt.Fprintf(stdout, "Piece %d downloaded to %s.\n", index, *outputPath)
 	return nil
 }
 
