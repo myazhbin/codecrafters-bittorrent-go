@@ -28,6 +28,8 @@ func run(args []string, stdout io.Writer) error {
 		return runInfo(args, stdout)
 	case "peers":
 		return runPeers(args, stdout)
+	case "handshake":
+		return runHandshake(args, stdout)
 	default:
 		return fmt.Errorf("unknown command: %s", command)
 	}
@@ -92,6 +94,28 @@ func runPeers(args []string, stdout io.Writer) error {
 	for _, peer := range peers {
 		fmt.Fprintln(stdout, peer)
 	}
+	return nil
+}
+
+// runHandshake implements `handshake <torrent file> <peer ip>:<peer port>`,
+// which exchanges handshakes with a peer and prints the peer's ID.
+func runHandshake(args []string, stdout io.Writer) error {
+	if len(args) != 2 {
+		return errors.New("usage: handshake <torrent file> <peer ip>:<peer port>")
+	}
+
+	torrent, err := loadTorrent(args[0])
+	if err != nil {
+		return err
+	}
+
+	peer, err := dialPeer(args[1], torrent.InfoHash, newPeerID())
+	if err != nil {
+		return err
+	}
+	defer peer.Close()
+
+	fmt.Fprintf(stdout, "Peer ID: %x\n", peer.ID)
 	return nil
 }
 

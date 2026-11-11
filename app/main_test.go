@@ -173,6 +173,44 @@ func TestRunPeersTrackerFailure(t *testing.T) {
 	}
 }
 
+func TestRunHandshake(t *testing.T) {
+	info := testInfoDict(testContent(100), 32)
+	infoHash := sha1.Sum([]byte(info))
+	peer := startTestPeer(t, infoHash)
+	path := writeTempFile(t, "test.torrent", testTorrentFile("http://tracker.example/announce", info))
+
+	got, err := runCommand(t, "handshake", path, peer.Address)
+	if err != nil {
+		t.Fatalf("handshake returned error: %v", err)
+	}
+
+	if want := "Peer ID: 0102030405060708090a0b0c0d0e0f1011121314\n"; got != want {
+		t.Errorf("handshake printed %q, want %q", got, want)
+	}
+
+	// The peer must have been greeted for this torrent in particular.
+	theirs := <-peer.Handshakes
+	if theirs.InfoHash != infoHash {
+		t.Errorf("handshake was sent with info hash %x, want %x", theirs.InfoHash, infoHash)
+	}
+	if theirs.Reserved != [8]byte{} {
+		t.Errorf("handshake was sent with reserved bytes %x, want all zeros", theirs.Reserved)
+	}
+}
+
+func TestRunHandshakeWithWrongTorrent(t *testing.T) {
+	peer := startTestPeer(t, [20]byte{0xaa})
+	path := writeTempFile(t, "test.torrent", testTorrentFile("http://tracker.example/announce", minimalInfo))
+
+	got, err := runCommand(t, "handshake", path, peer.Address)
+	if err == nil || !strings.Contains(err.Error(), "different torrent") {
+		t.Errorf("handshake error = %v, want one about the peer having a different torrent", err)
+	}
+	if got != "" {
+		t.Errorf("handshake printed %q despite failing, want no output", got)
+	}
+}
+
 func TestRunErrors(t *testing.T) {
 	notATorrent := writeTempFile(t, "not-a.torrent", []byte("i52e"))
 
@@ -197,6 +235,10 @@ func TestRunErrors(t *testing.T) {
 		{"info with a file that isn't a torrent", []string{"info", notATorrent}, "not a dictionary"},
 		{"peers without a file", []string{"peers"}, "usage: peers"},
 		{"peers with a missing file", []string{"peers", "does-not-exist.torrent"}, "no such file"},
+		{"handshake without a peer", []string{"handshake", sampleTorrentPath}, "usage: handshake"},
+		{"handshake without arguments", []string{"handshake"}, "usage: handshake"},
+		{"handshake with a missing file", []string{"handshake", "does-not-exist.torrent", "127.0.0.1:6881"}, "no such file"},
+		{"handshake with a malformed peer address", []string{"handshake", sampleTorrentPath, "nowhere"}, "missing port"},
 	}
 
 	for _, tt := range tests {
