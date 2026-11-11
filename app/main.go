@@ -37,6 +37,8 @@ func run(args []string, stdout io.Writer) error {
 		return runDownloadPiece(args, stdout)
 	case "download":
 		return runDownload(args, stdout)
+	case "magnet_parse":
+		return runMagnetParse(args, stdout)
 	default:
 		return fmt.Errorf("unknown command: %s", command)
 	}
@@ -180,6 +182,27 @@ func runDownload(args []string, stdout io.Writer) error {
 	}
 
 	fmt.Fprintf(stdout, "Downloaded %s to %s.\n", args[0], outputPath)
+	return nil
+}
+
+// runMagnetParse implements `magnet_parse <magnet link>`, which prints what a
+// magnet link says about a torrent.
+func runMagnetParse(args []string, stdout io.Writer) error {
+	if len(args) != 1 {
+		return errors.New("usage: magnet_parse <magnet link>")
+	}
+
+	link, err := parseMagnetLink(args[0])
+	if err != nil {
+		return err
+	}
+
+	tracker := ""
+	if len(link.Trackers) > 0 {
+		tracker = link.Trackers[0]
+	}
+	fmt.Fprintf(stdout, "Tracker URL: %s\n", tracker)
+	fmt.Fprintf(stdout, "Info Hash: %x\n", link.InfoHash)
 	return nil
 }
 
