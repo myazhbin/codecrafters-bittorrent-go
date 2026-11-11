@@ -1,6 +1,8 @@
 package main
 
 import (
+	"bytes"
+	"crypto/sha1"
 	"encoding/base32"
 	"encoding/hex"
 	"fmt"
@@ -414,64 +416,196 @@ func TestRunMagnetHandshakeErrors(t *testing.T) {
 	}
 }
 
-func TestRunMagnetInfoRequestsMetadata(t *testing.T) {
-	infoHash := exampleHandshake.InfoHash
-	peer := startTestPeer(t, &testPeer{InfoHash: infoHash, Reserved: extensionsReserved, MetadataID: 42})
-	tracker := startTestTracker(t, peer.Address)
+// seedTestMagnet sets up everything that's needed to download a file with
+// the given contents starting from a magnet link: a fake seeder that serves
+// the torrent's metadata as well as its pieces, and a fake tracker that knows
+// of the seeder. It returns the magnet link along with the seeder. Any other
+// peer addresses given are listed by the tracker ahead of the seeder's.
+func seedTestMagnet(t *testing.T, content []byte, pieceLength int, otherPeers ...string) (string, *testPeer) {
+	t.Helper()
 
-	if _, err := runCommand(t, "magnet_info", testMagnetLink(infoHash, tracker.AnnounceURL)); err != nil {
+	info := testInfoDict(content, pieceLength)
+	seeder := startTestPeer(t, &testPeer{
+		InfoHash:    sha1.Sum([]byte(info)),
+		Content:     content,
+		PieceLength: pieceLength,
+		Reserved:    extensionsReserved,
+		MetadataID:  42,
+		Metadata:    []byte(info),
+	})
+	tracker := startTestTracker(t, append(otherPeers, seeder.Address)...)
+
+	return testMagnetLink(seeder.InfoHash, tracker.AnnounceURL), seeder
+}
+
+func TestRunMagnetInfo(t *testing.T) {
+	content := testContent(2500)
+	info := testInfoDict(content, 1024)
+	infoHash := sha1.Sum([]byte(info))
+	seeder := startTestPeer(t, &testPeer{
+		InfoHash:   infoHash,
+		Reserved:   extensionsReserved,
+		MetadataID: 42,
+		Metadata:   []byte(info),
+	})
+	tracker := startTestTracker(t, seeder.Address)
+
+	got, err := runCommand(t, "magnet_info", testMagnetLink(infoHash, tracker.AnnounceURL))
+	if err != nil {
 		t.Fatalf("magnet_info returned error: %v", err)
+	}
+
+	want := "Tracker URL: " + tracker.AnnounceURL + "\n" +
+		"Length: 2500\n" +
+		fmt.Sprintf("Info Hash: %x\n", infoHash) +
+		"Piece Length: 1024\n" +
+		"Piece Hashes:\n" +
+		fmt.Sprintf("%x\n", sha1.Sum(content[:1024])) +
+		fmt.Sprintf("%x\n", sha1.Sum(content[1024:2048])) +
+		fmt.Sprintf("%x\n", sha1.Sum(content[2048:]))
+	if got != want {
+		t.Errorf("magnet_info printed:\n%s\nwant:\n%s", got, want)
+	}
+
+	// It's the very same as what the info command prints for the torrent's
+	// torrent file.
+	torrentPath := writeTempFile(t, "test.torrent", testTorrentFile(tracker.AnnounceURL, info))
+	if fromFile, err := runCommand(t, "info", torrentPath); err != nil || fromFile != got {
+		t.Errorf("info printed:\n%s\n(error: %v), which differs from what magnet_info printed:\n%s", fromFile, err, got)
 	}
 
 	// After the extension handshake, the peer must have been asked for the
 	// first piece of the metadata, in a message sent with the ID that the
-	// peer itself picked for the metadata extension.
-	messages := messagesAfterHangup(t, peer)
+	// peer itself picked for the metadata extension. The metadata fits in one
+	// piece, so that's all there should be.
+	messages := messagesAfterHangup(t, seeder)
 	if len(messages) != 2 {
-		t.Fatalf("the peer received %d messages, want the extension handshake and the metadata request: %+v", len(messages), messages)
+		t.Fatalf("the peer received %d messages, want the extension handshake and one metadata request: %+v", len(messages), messages)
 	}
 	if got := messages[0].encode(); string(got) != ourExtensionHandshake {
 		t.Errorf("the peer first received the message %q, want %q", got, ourExtensionHandshake)
 	}
-	want := "\x00\x00\x00\x1b" + "\x14" + "\x2a" + "d8:msg_typei0e5:piecei0ee"
-	if got := messages[1].encode(); string(got) != want {
-		t.Errorf("the peer then received the message %q, want %q", got, want)
+	wantRequest := "\x00\x00\x00\x1b" + "\x14" + "\x2a" + "d8:msg_typei0e5:piecei0ee"
+	if got := messages[1].encode(); string(got) != wantRequest {
+		t.Errorf("the peer then received the message %q, want %q", got, wantRequest)
 	}
 
-	if ours := <-peer.Handshakes; ours.Reserved != extensionsReserved || ours.InfoHash != infoHash {
+	if ours := <-seeder.Handshakes; ours.Reserved != extensionsReserved || ours.InfoHash != infoHash {
 		t.Errorf("the handshake was sent with reserved bytes % x and info hash %x", ours.Reserved, ours.InfoHash)
 	}
 }
 
-// Metadata can only come from a peer that supports the metadata extension, so
-// peers that don't are passed over.
-func TestRunMagnetInfoSkipsPeersWithoutMetadataSupport(t *testing.T) {
-	infoHash := exampleHandshake.InfoHash
-	noExtensions := startTestPeer(t, &testPeer{InfoHash: infoHash})
-	noMetadata := startTestPeer(t, &testPeer{InfoHash: infoHash, Reserved: extensionsReserved})
-	good := startTestPeer(t, &testPeer{InfoHash: infoHash, Reserved: extensionsReserved, MetadataID: 7})
-	tracker := startTestTracker(t, stoppedServerAddress(t), noExtensions.Address, noMetadata.Address, good.Address)
+// Metadata that's too big for a single 16 KiB piece has to be put together
+// from several.
+func TestRunMagnetInfoWithLargeMetadata(t *testing.T) {
+	// A thousand piece hashes alone come to 20,000 bytes.
+	content := testContent(100_000)
+	info := testInfoDict(content, 100)
+	if len(info) <= metadataPieceSize {
+		t.Fatalf("the metadata is only %d bytes long, which fits in one piece", len(info))
+	}
+	link, seeder := seedTestMagnet(t, content, 100)
 
-	if _, err := runCommand(t, "magnet_info", testMagnetLink(infoHash, tracker.AnnounceURL)); err != nil {
+	got, err := runCommand(t, "magnet_info", link)
+	if err != nil {
 		t.Fatalf("magnet_info returned error: %v", err)
 	}
 
-	messages := messagesAfterHangup(t, good)
-	if len(messages) != 2 {
-		t.Fatalf("the peer with metadata support received %d messages, want 2: %+v", len(messages), messages)
+	lines := strings.Split(strings.TrimSuffix(got, "\n"), "\n")
+	if len(lines) != 5+1000 {
+		t.Fatalf("magnet_info printed %d lines, want %d", len(lines), 5+1000)
 	}
-	if want := "\x07d8:msg_typei0e5:piecei0ee"; string(messages[1].Payload) != want {
-		t.Errorf("the peer with metadata support was sent %q, want %q", messages[1].Payload, want)
+	if want := fmt.Sprintf("Info Hash: %x", sha1.Sum([]byte(info))); lines[2] != want {
+		t.Errorf("magnet_info printed %q, want %q", lines[2], want)
 	}
-	if got := messagesAfterHangup(t, noExtensions); len(got) != 0 {
-		t.Errorf("the peer without extension support was sent %d messages, want none: %+v", len(got), got)
+	for _, index := range []int{0, 819, 820, 999} { // Hashes from both pieces of the metadata
+		want := fmt.Sprintf("%x", sha1.Sum(content[index*100:(index+1)*100]))
+		if lines[5+index] != want {
+			t.Errorf("the hash printed for piece %d is %q, want %q", index, lines[5+index], want)
+		}
+	}
+
+	var requests []string
+	for _, m := range messagesAfterHangup(t, seeder)[1:] {
+		requests = append(requests, string(m.Payload[1:]))
+	}
+	if want := []string{"d8:msg_typei0e5:piecei0ee", "d8:msg_typei0e5:piecei1ee"}; !reflect.DeepEqual(requests, want) {
+		t.Errorf("the peer was sent the metadata requests %q, want %q", requests, want)
+	}
+}
+
+// Peers that can't or won't provide the right metadata are passed over.
+func TestRunMagnetInfoSkipsPeersWithoutMetadata(t *testing.T) {
+	content := testContent(2500)
+	info := testInfoDict(content, 1024)
+	infoHash := sha1.Sum([]byte(info))
+
+	badPeer := func(peer *testPeer) *testPeer {
+		peer.InfoHash = infoHash
+		return startTestPeer(t, peer)
+	}
+	badPeers := map[string]*testPeer{
+		"doesn't support extensions":             badPeer(&testPeer{}),
+		"doesn't support the metadata extension": badPeer(&testPeer{Reserved: extensionsReserved}),
+		"doesn't have the metadata":              badPeer(&testPeer{Reserved: extensionsReserved, MetadataID: 3}),
+		"serves the metadata of another torrent": badPeer(&testPeer{Reserved: extensionsReserved, MetadataID: 3, Metadata: []byte(minimalInfo)}),
+		"serves corrupt metadata": badPeer(&testPeer{
+			Reserved:   extensionsReserved,
+			MetadataID: 3,
+			Metadata:   []byte(info),
+			MetadataTamper: func(header map[string]interface{}, data []byte) (map[string]interface{}, []byte) {
+				data = bytes.Clone(data)
+				data[len(data)/2] ^= 0x01
+				return header, data
+			},
+		}),
+	}
+	addresses := []string{stoppedServerAddress(t)}
+	for _, peer := range badPeers {
+		addresses = append(addresses, peer.Address)
+	}
+	link, _ := seedTestMagnet(t, content, 1024, addresses...)
+
+	got, err := runCommand(t, "magnet_info", link)
+	if err != nil {
+		t.Fatalf("magnet_info returned error: %v", err)
+	}
+	if want := fmt.Sprintf("Info Hash: %x\n", infoHash); !strings.Contains(got, want) {
+		t.Errorf("magnet_info printed:\n%s\nwant it to include %q", got, want)
+	}
+	if want := "Length: 2500\n"; !strings.Contains(got, want) {
+		t.Errorf("magnet_info printed:\n%s\nwant it to include %q", got, want)
+	}
+
+	for name, peer := range badPeers {
+		if len(peer.Handshakes) != 1 {
+			t.Errorf("the peer that %s was connected to %d times, want once", name, len(peer.Handshakes))
+		}
 	}
 }
 
 func TestRunMagnetInfoErrors(t *testing.T) {
-	infoHash := exampleHandshake.InfoHash
+	infoHash := sha1.Sum([]byte(minimalInfo))
 	noExtensions := startTestPeer(t, &testPeer{InfoHash: infoHash})
-	noMetadata := startTestPeer(t, &testPeer{InfoHash: infoHash, Reserved: extensionsReserved})
+	noMetadataSupport := startTestPeer(t, &testPeer{InfoHash: infoHash, Reserved: extensionsReserved})
+	noMetadata := startTestPeer(t, &testPeer{InfoHash: infoHash, Reserved: extensionsReserved, MetadataID: 3})
+	wrongMetadata := startTestPeer(t, &testPeer{
+		InfoHash:   infoHash,
+		Reserved:   extensionsReserved,
+		MetadataID: 3,
+		Metadata:   []byte(testInfoDict(testContent(10), 5)),
+	})
+
+	// A torrent whose metadata is what it should be, but describes something
+	// that can't be downloaded.
+	const multiFileInfo = "d5:filesld6:lengthi1e4:pathl1:aeee4:name1:a12:piece lengthi1e6:pieces20:" + testPieceHash + "e"
+	multiFileHash := sha1.Sum([]byte(multiFileInfo))
+	multiFile := startTestPeer(t, &testPeer{
+		InfoHash:   multiFileHash,
+		Reserved:   extensionsReserved,
+		MetadataID: 3,
+		Metadata:   []byte(multiFileInfo),
+	})
 
 	tests := []struct {
 		name    string
@@ -490,8 +624,23 @@ func TestRunMagnetInfoErrors(t *testing.T) {
 		},
 		{
 			"peer without metadata support",
+			[]string{testMagnetLink(infoHash, startTestTracker(t, noMetadataSupport.Address).AnnounceURL)},
+			"peer " + noMetadataSupport.Address + ": peer doesn't support the metadata extension",
+		},
+		{
+			"peer without the metadata",
 			[]string{testMagnetLink(infoHash, startTestTracker(t, noMetadata.Address).AnnounceURL)},
-			"peer " + noMetadata.Address + ": peer doesn't support the metadata extension",
+			"peer " + noMetadata.Address + ": peer turned down the request for piece 0 of the metadata",
+		},
+		{
+			"peer with the wrong metadata",
+			[]string{testMagnetLink(infoHash, startTestTracker(t, wrongMetadata.Address).AnnounceURL)},
+			"peer " + wrongMetadata.Address + ": metadata from peer doesn't match the torrent's info hash",
+		},
+		{
+			"multi-file torrent",
+			[]string{testMagnetLink(multiFileHash, startTestTracker(t, multiFile.Address).AnnounceURL)},
+			"invalid metadata: multi-file torrents are not supported",
 		},
 	}
 

@@ -106,3 +106,32 @@ func (s *swarm) connect(ctx context.Context, prepare func(peer *peerConn) error)
 	}
 	return nil, fmt.Errorf("no peer worked out:\n%w", errors.Join(failures...))
 }
+
+// fetchTorrent gets the torrent's metadata from one of the swarm's peers, and
+// returns the torrent that the metadata describes. It's how the details of a
+// torrent are come by when all there is to go on is a magnet link.
+//
+// The connection to the peer that provided the metadata is returned as well,
+// so that it can go on to be used for downloading from that peer.
+func (s *swarm) fetchTorrent(ctx context.Context) (*Torrent, *peerConn, error) {
+	var torrent *Torrent
+	peer, err := s.connect(ctx, func(peer *peerConn) error {
+		if !peer.SupportsExtensions {
+			return errors.New("peer doesn't support protocol extensions")
+		}
+		if err := peer.handshakeExtensions(); err != nil {
+			return err
+		}
+
+		metadata, err := peer.downloadMetadata(s.greeting.InfoHash)
+		if err != nil {
+			return err
+		}
+		torrent, err = torrentFromMetadata(metadata, s.trackers[0])
+		return err
+	})
+	if err != nil {
+		return nil, nil, err
+	}
+	return torrent, peer, nil
+}

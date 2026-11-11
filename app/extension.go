@@ -1,6 +1,7 @@
 package main
 
 import (
+	"crypto/sha1"
 	"errors"
 	"fmt"
 )
@@ -31,6 +32,20 @@ const (
 // dictionary that gives its type under the key "msg_type".
 const (
 	metadataRequest = 0 // Asks for a piece of the metadata
+	metadataData    = 1 // Carries a piece of the metadata, which follows the dictionary
+	metadataReject  = 2 // Turns down a request for a piece of the metadata
+)
+
+const (
+	// metadataPieceSize is the size of the pieces that metadata is
+	// transferred in. The last piece is smaller if the size of the metadata
+	// isn't a multiple of it.
+	metadataPieceSize = 16 * 1024
+
+	// maxMetadataSize caps the size of the metadata accepted from a peer, so
+	// that a misbehaving peer can't exhaust memory. Real metadata, even of
+	// torrents with a huge number of pieces, is a small fraction of this.
+	maxMetadataSize = 32 << 20
 )
 
 // extensionMessage returns a message of the extension protocol. Such
@@ -141,4 +156,120 @@ func (p *peerConn) requestMetadataPiece(piece int) error {
 		"piece":    piece,
 	})
 	return p.send(extensionMessage(id, payload))
+}
+
+// downloadMetadata downloads the torrent's metadata from the peer, one piece
+// after another. The returned metadata has been verified against the
+// torrent's info hash, which is the hash of the metadata.
+func (p *peerConn) downloadMetadata(infoHash [20]byte) ([]byte, error) {
+	var metadata []byte
+	totalSize := 0 // The size of the whole of the metadata
+	for piece := 0; ; piece++ {
+		if err := p.requestMetadataPiece(piece); err != nil {
+			return nil, err
+		}
+		reply, err := p.receiveMetadataPiece(piece)
+		if err != nil {
+			return nil, err
+		}
+
+		// Every piece comes with the size of the metadata as a whole, which
+		// isn't known before the first piece arrives.
+		if piece == 0 {
+			if reply.TotalSize <= 0 || reply.TotalSize > maxMetadataSize {
+				return nil, fmt.Errorf("peer claims that the metadata is %d bytes long", reply.TotalSize)
+			}
+			totalSize = int(reply.TotalSize)
+			metadata = make([]byte, 0, totalSize)
+		} else if reply.TotalSize != int64(totalSize) {
+			return nil, fmt.Errorf("peer changed its mind about the size of the metadata, from %d bytes to %d",
+				totalSize, reply.TotalSize)
+		}
+
+		// A piece is the standard size, unless it's the last one.
+		if want := min(metadataPieceSize, totalSize-len(metadata)); len(reply.Data) != want {
+			return nil, fmt.Errorf("peer sent %d bytes for a piece of metadata of %d bytes", len(reply.Data), want)
+		}
+		metadata = append(metadata, reply.Data...)
+		if len(metadata) == totalSize {
+			break
+		}
+	}
+
+	if sha1.Sum(metadata) != infoHash {
+		return nil, errors.New("metadata from peer doesn't match the torrent's info hash")
+	}
+	return metadata, nil
+}
+
+// receiveMetadataPiece waits for the peer's answer to a request for the
+// piece of metadata with the given index, and returns it if it's the piece.
+func (p *peerConn) receiveMetadataPiece(piece int) (metadataMessage, error) {
+	for {
+		m, err := p.receive()
+		if err != nil {
+			return metadataMessage{}, err
+		}
+		// The peer sends the metadata extension's messages with the ID that
+		// we picked for the extension.
+		if m.ID != msgExtended || m.Payload[0] != ourMetadataID {
+			continue
+		}
+
+		reply, err := parseMetadataMessage(m.Payload[1:])
+		if err != nil {
+			return metadataMessage{}, err
+		}
+		switch reply.Type {
+		case metadataData:
+			if reply.Piece != int64(piece) {
+				return metadataMessage{}, fmt.Errorf("peer sent piece %d of the metadata, which wasn't requested", reply.Piece)
+			}
+			return reply, nil
+		case metadataReject:
+			return metadataMessage{}, fmt.Errorf("peer turned down the request for piece %d of the metadata", piece)
+		}
+		// Anything else isn't an answer to the request: requests of the
+		// peer's own go unanswered, as there's no metadata here to give it,
+		// and message types that aren't known are to be ignored.
+	}
+}
+
+// metadataMessage is a message of the metadata extension.
+type metadataMessage struct {
+	Type      int64  // One of the metadata message types
+	Piece     int64  // The index of the piece of metadata that the message is about
+	TotalSize int64  // The size of the whole of the metadata (data messages only)
+	Data      []byte // The piece of metadata (data messages only)
+}
+
+// parseMetadataMessage parses the payload of a metadata extension message.
+// It's a bencoded dictionary which, in the case of a data message, is
+// followed by the piece of metadata that the message carries:
+//
+//	{"msg_type": 1, "piece": 0, "total_size": 3425}<piece of metadata>
+func parseMetadataMessage(payload []byte) (metadataMessage, error) {
+	decoded, rest, err := decodeBencodePrefix(string(payload))
+	if err != nil {
+		return metadataMessage{}, fmt.Errorf("peer sent a malformed metadata message: %w", err)
+	}
+	dict, ok := decoded.(map[string]interface{})
+	if !ok {
+		return metadataMessage{}, errors.New("peer sent a malformed metadata message: not a dictionary")
+	}
+
+	var m metadataMessage
+	if m.Type, err = dictInt(dict, "msg_type"); err != nil {
+		return metadataMessage{}, fmt.Errorf("peer sent a malformed metadata message: %w", err)
+	}
+	if m.Piece, err = dictInt(dict, "piece"); err != nil {
+		return metadataMessage{}, fmt.Errorf("peer sent a malformed metadata message: %w", err)
+	}
+	if m.Type == metadataData {
+		if m.TotalSize, err = dictInt(dict, "total_size"); err != nil {
+			return metadataMessage{}, fmt.Errorf("peer sent a malformed metadata message: %w", err)
+		}
+		m.Data = []byte(rest)
+	}
+	return m, nil
 }

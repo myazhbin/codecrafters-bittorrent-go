@@ -501,3 +501,56 @@ func TestEncodeBencodeUnsupportedTypes(t *testing.T) {
 		})
 	}
 }
+
+func TestDecodeBencodePrefix(t *testing.T) {
+	tests := []struct {
+		name      string
+		input     string
+		wantValue interface{}
+		wantRest  string
+	}{
+		{"nothing after the value", "i52e", int64(52), ""},
+		{"string followed by data", "5:helloworld", "hello", "world"},
+		{"integer followed by data", "i52ei53e", int64(52), "i53e"},
+		{"list followed by data", "l1:aee", []interface{}{"a"}, "e"},
+		{
+			"dictionary followed by binary data",
+			"d8:msg_typei1e5:piecei0ee\x00\xff\x01",
+			map[string]interface{}{"msg_type": int64(1), "piece": int64(0)},
+			"\x00\xff\x01",
+		},
+		{
+			"dictionary followed by more bencode",
+			"d1:ai1eed1:bi2ee",
+			map[string]interface{}{"a": int64(1)},
+			"d1:bi2ee",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			value, rest, err := decodeBencodePrefix(tt.input)
+			if err != nil {
+				t.Fatalf("decodeBencodePrefix(%q) returned error: %v", tt.input, err)
+			}
+			if !reflect.DeepEqual(value, tt.wantValue) {
+				t.Errorf("decodeBencodePrefix(%q) value = %#v, want %#v", tt.input, value, tt.wantValue)
+			}
+			if rest != tt.wantRest {
+				t.Errorf("decodeBencodePrefix(%q) rest = %q, want %q", tt.input, rest, tt.wantRest)
+			}
+		})
+	}
+}
+
+func TestDecodeBencodePrefixErrors(t *testing.T) {
+	for _, input := range []string{"", "x", "i52", "5:hell", "l1:a", "d1:ai1e", "d1:ae"} {
+		value, rest, err := decodeBencodePrefix(input)
+		if err == nil {
+			t.Errorf("decodeBencodePrefix(%q) = %#v, %q, want an error", input, value, rest)
+		}
+		if value != nil || rest != "" {
+			t.Errorf("decodeBencodePrefix(%q) returned %#v, %q alongside an error", input, value, rest)
+		}
+	}
+}

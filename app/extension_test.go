@@ -1,7 +1,10 @@
 package main
 
 import (
+	"bytes"
 	"context"
+	"crypto/sha1"
+	"fmt"
 	"io"
 	"net"
 	"os"
@@ -462,6 +465,412 @@ func TestRequestMetadataPieceWithoutSupport(t *testing.T) {
 				if m.ID == msgExtended && m.Payload[0] != extensionHandshakeID {
 					t.Errorf("the peer was sent the extension message %q", m.Payload)
 				}
+			}
+		})
+	}
+}
+
+// metadataPeer starts a fake peer that serves the given metadata, and returns
+// a connection to it on which extension handshakes have been exchanged. The
+// peer is set up by adjust first, if that's given.
+func metadataPeer(t *testing.T, metadata []byte, adjust func(peer *testPeer)) (*peerConn, *testPeer) {
+	t.Helper()
+
+	fake := &testPeer{
+		InfoHash:   sha1.Sum(metadata),
+		Reserved:   extensionsReserved,
+		MetadataID: 42,
+		Metadata:   metadata,
+	}
+	if adjust != nil {
+		adjust(fake)
+	}
+	startTestPeer(t, fake)
+
+	peer := dialWithExtensions(t, fake.Address, fake.InfoHash)
+	if err := peer.handshakeExtensions(); err != nil {
+		t.Fatalf("handshakeExtensions returned error: %v", err)
+	}
+	return peer, fake
+}
+
+func TestDownloadMetadata(t *testing.T) {
+	// Metadata is hashed rather than parsed while it's downloaded, so any
+	// bytes will do for it here. Pieces of metadata are 16,384 bytes long.
+	for _, size := range []int{1, 100, 16383, 16384, 16385, 32768, 40_000, 100_000} {
+		metadata := testContent(size)
+		peer, fake := metadataPeer(t, metadata, nil)
+
+		got, err := peer.downloadMetadata(sha1.Sum(metadata))
+		if err != nil {
+			t.Fatalf("downloading %d bytes of metadata returned error: %v", size, err)
+		}
+		if !bytes.Equal(got, metadata) {
+			t.Errorf("downloading %d bytes of metadata returned the wrong data (%d bytes)", size, len(got))
+		}
+		peer.Close()
+
+		// One request per piece, in order, and no more than that.
+		var want []string
+		for piece := 0; piece*16384 < size; piece++ {
+			want = append(want, fmt.Sprintf("\x2ad8:msg_typei0e5:piecei%dee", piece))
+		}
+		var requests []string
+		for _, m := range messagesAfterHangup(t, fake)[1:] {
+			requests = append(requests, string(m.Payload))
+		}
+		if !reflect.DeepEqual(requests, want) {
+			t.Errorf("downloading %d bytes of metadata sent the requests %q, want %q", size, requests, want)
+		}
+	}
+}
+
+func TestDownloadMetadataFromAwkwardPeers(t *testing.T) {
+	metadata := testContent(40_000)
+
+	tests := []struct {
+		name   string
+		adjust func(peer *testPeer)
+	}{
+		{"sends other messages in between", func(peer *testPeer) { peer.Chatty = true }},
+		{"sends everything in fragments", func(peer *testPeer) { peer.WriteChunkSize = 97 }},
+		{"sent its extension handshake early", func(peer *testPeer) { peer.EagerExtensionHandshake = true }},
+		{"uses the same ID for the extension as we do", func(peer *testPeer) { peer.MetadataID = ourMetadataID }},
+		{"has no pieces of the file to announce", func(peer *testPeer) { peer.NoBitfield, peer.EagerExtensionHandshake = true, true }},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			peer, _ := metadataPeer(t, metadata, tt.adjust)
+
+			got, err := peer.downloadMetadata(sha1.Sum(metadata))
+			if err != nil {
+				t.Fatalf("downloadMetadata returned error: %v", err)
+			}
+			if !bytes.Equal(got, metadata) {
+				t.Errorf("downloadMetadata returned the wrong data (%d bytes, want %d)", len(got), len(metadata))
+			}
+		})
+	}
+}
+
+func TestDownloadMetadataRejectsBadReplies(t *testing.T) {
+	metadata := testContent(40_000) // Three pieces: two whole ones, and one of 7,232 bytes
+
+	type header = map[string]interface{}
+	tests := []struct {
+		name    string
+		tamper  func(h header, data []byte) (header, []byte)
+		wantErr string
+	}{
+		{
+			"corrupted data",
+			func(h header, data []byte) (header, []byte) {
+				if h["piece"] == int64(1) {
+					data = bytes.Clone(data)
+					data[5] ^= 0x01
+				}
+				return h, data
+			},
+			"metadata from peer doesn't match the torrent's info hash",
+		},
+		{
+			"another piece than the one asked for",
+			func(h header, data []byte) (header, []byte) { h["piece"] = h["piece"].(int64) + 1; return h, data },
+			"peer sent piece 1 of the metadata, which wasn't requested",
+		},
+		{
+			"size of zero",
+			func(h header, data []byte) (header, []byte) { h["total_size"] = 0; return h, data },
+			"peer claims that the metadata is 0 bytes long",
+		},
+		{
+			"negative size",
+			func(h header, data []byte) (header, []byte) { h["total_size"] = -40_000; return h, data },
+			"peer claims that the metadata is -40000 bytes long",
+		},
+		{
+			"enormous size",
+			func(h header, data []byte) (header, []byte) { h["total_size"] = int64(1) << 40; return h, data },
+			"peer claims that the metadata is 1099511627776 bytes long",
+		},
+		{
+			"size that changes from one piece to the next",
+			func(h header, data []byte) (header, []byte) {
+				if h["piece"] == int64(1) {
+					h["total_size"] = 50_000
+				}
+				return h, data
+			},
+			"peer changed its mind about the size of the metadata, from 40000 bytes to 50000",
+		},
+		{
+			"piece that's too short",
+			func(h header, data []byte) (header, []byte) { return h, data[:len(data)-1] },
+			"peer sent 16383 bytes for a piece of metadata of 16384 bytes",
+		},
+		{
+			"piece that's too long",
+			func(h header, data []byte) (header, []byte) { return h, append(bytes.Clone(data), 0) },
+			"peer sent 16385 bytes for a piece of metadata of 16384 bytes",
+		},
+		{
+			"piece without any data",
+			func(h header, data []byte) (header, []byte) { return h, nil },
+			"peer sent 0 bytes for a piece of metadata of 16384 bytes",
+		},
+		{
+			"last piece that's padded to the full size",
+			func(h header, data []byte) (header, []byte) {
+				if h["piece"] == int64(2) {
+					data = append(bytes.Clone(data), make([]byte, 16384-len(data))...)
+				}
+				return h, data
+			},
+			"peer sent 16384 bytes for a piece of metadata of 7232 bytes",
+		},
+		{
+			"size smaller than the first piece",
+			func(h header, data []byte) (header, []byte) { h["total_size"] = 100; return h, data },
+			"peer sent 16384 bytes for a piece of metadata of 100 bytes",
+		},
+		{
+			"no size",
+			func(h header, data []byte) (header, []byte) { delete(h, "total_size"); return h, data },
+			`peer sent a malformed metadata message: missing "total_size"`,
+		},
+		{
+			"no piece index",
+			func(h header, data []byte) (header, []byte) { delete(h, "piece"); return h, data },
+			`peer sent a malformed metadata message: missing "piece"`,
+		},
+		{
+			"no message type",
+			func(h header, data []byte) (header, []byte) { delete(h, "msg_type"); return h, data },
+			`peer sent a malformed metadata message: missing "msg_type"`,
+		},
+		{
+			"message type that isn't a number",
+			func(h header, data []byte) (header, []byte) { h["msg_type"] = "data"; return h, data },
+			`peer sent a malformed metadata message: "msg_type" is not an integer`,
+		},
+		{
+			"rejection",
+			func(h header, data []byte) (header, []byte) { return header{"msg_type": 2, "piece": h["piece"]}, nil },
+			"peer turned down the request for piece 0 of the metadata",
+		},
+		{
+			"rejection part-way through",
+			func(h header, data []byte) (header, []byte) {
+				if h["piece"] == int64(2) {
+					return header{"msg_type": 2, "piece": 2}, nil
+				}
+				return h, data
+			},
+			"peer turned down the request for piece 2 of the metadata",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			peer, _ := metadataPeer(t, metadata, func(peer *testPeer) { peer.MetadataTamper = tt.tamper })
+
+			got, err := peer.downloadMetadata(sha1.Sum(metadata))
+			if err == nil {
+				t.Fatalf("downloadMetadata returned %d bytes, want an error containing %q", len(got), tt.wantErr)
+			}
+			if !strings.Contains(err.Error(), tt.wantErr) {
+				t.Errorf("downloadMetadata error = %q, want it to contain %q", err, tt.wantErr)
+			}
+		})
+	}
+}
+
+// The metadata must be the one that the info hash stands for, however
+// convincing what a peer sends may otherwise be.
+func TestDownloadMetadataChecksInfoHash(t *testing.T) {
+	metadata := []byte(minimalInfo)
+	peer, _ := metadataPeer(t, metadata, nil)
+
+	got, err := peer.downloadMetadata([20]byte{0xaa})
+	if err == nil || !strings.Contains(err.Error(), "metadata from peer doesn't match the torrent's info hash") {
+		t.Errorf("downloadMetadata = %q, %v, want an error about the info hash", got, err)
+	}
+}
+
+func TestDownloadMetadataFromPeerWithoutIt(t *testing.T) {
+	peer, _ := metadataPeer(t, nil, nil)
+
+	_, err := peer.downloadMetadata([20]byte{})
+	if err == nil || !strings.Contains(err.Error(), "peer turned down the request for piece 0 of the metadata") {
+		t.Errorf("downloadMetadata error = %v, want one saying that the request was turned down", err)
+	}
+}
+
+// scriptedMetadataPeer returns a connection to a peer that goes through the
+// handshakes, waits for a metadata request, and then follows the given
+// script. The script's send function sends a metadata extension message with
+// the given payload.
+func scriptedMetadataPeer(t *testing.T, infoHash [20]byte, script func(conn net.Conn, send func(payload string))) *peerConn {
+	t.Helper()
+
+	address := startTestServer(t, func(conn net.Conn) {
+		if _, err := readHandshake(conn); err != nil {
+			return
+		}
+		conn.Write(handshake{Reserved: extensionsReserved, InfoHash: infoHash, PeerID: testPeerID}.encode())
+		conn.Write(message{ID: msgBitfield, Payload: []byte{0x80}}.encode())
+		if _, err := readMessage(conn); err != nil { // The client's extension handshake
+			return
+		}
+		conn.Write(extensionMessage(0, []byte("d1:md11:ut_metadatai42eee")).encode())
+		if _, err := readMessage(conn); err != nil { // The metadata request
+			return
+		}
+
+		script(conn, func(payload string) {
+			conn.Write(extensionMessage(ourMetadataID, []byte(payload)).encode())
+		})
+		io.Copy(io.Discard, conn)
+	})
+
+	peer := dialWithExtensions(t, address, infoHash)
+	if err := peer.handshakeExtensions(); err != nil {
+		t.Fatalf("handshakeExtensions returned error: %v", err)
+	}
+	return peer
+}
+
+// While waiting for a piece of metadata, anything else that the peer sends is
+// passed over, including metadata messages that aren't an answer.
+func TestDownloadMetadataIgnoresUnrelatedMessages(t *testing.T) {
+	metadata := []byte(minimalInfo)
+	infoHash := sha1.Sum(metadata)
+
+	peer := scriptedMetadataPeer(t, infoHash, func(conn net.Conn, send func(payload string)) {
+		conn.Write([]byte{0, 0, 0, 0})                                         // A keep-alive
+		conn.Write(message{ID: msgHave, Payload: []byte{0, 0, 0, 0}}.encode()) // A message of the base protocol
+		conn.Write(extensionMessage(9, []byte("for another extension")).encode())
+		conn.Write(extensionMessage(0, []byte("d1:md6:ut_pexi2eee")).encode()) // A further extension handshake
+		send("d8:msg_typei0e5:piecei0ee")                                      // A request of the peer's own
+		send("d8:msg_typei3e5:piecei0ee")                                      // A type of message that doesn't exist yet
+		send(fmt.Sprintf("d8:msg_typei1e5:piecei0e10:total_sizei%dee%s", len(metadata), metadata))
+	})
+
+	got, err := peer.downloadMetadata(infoHash)
+	if err != nil {
+		t.Fatalf("downloadMetadata returned error: %v", err)
+	}
+	if !bytes.Equal(got, metadata) {
+		t.Errorf("downloadMetadata = %q, want %q", got, metadata)
+	}
+
+	// What the unrelated messages had to say was still taken in.
+	if !peer.hasPiece(0) {
+		t.Error("the have message that arrived while waiting wasn't taken in")
+	}
+	if id := peer.extensionIDs["ut_pex"]; id != 2 {
+		t.Errorf("the ID of the extension added while waiting is %d, want 2", id)
+	}
+}
+
+func TestDownloadMetadataFromUncooperativePeer(t *testing.T) {
+	shortenTimeout(t, &peerMessageTimeout)
+
+	metadata := []byte(minimalInfo)
+	infoHash := sha1.Sum(metadata)
+
+	tests := []struct {
+		name    string
+		script  func(conn net.Conn, send func(payload string))
+		wantErr string
+	}{
+		{"never answers", func(conn net.Conn, send func(payload string)) {}, "i/o timeout"},
+		{"hangs up", func(conn net.Conn, send func(payload string)) { conn.Close() }, "receiving message from peer"},
+		{
+			"only sends unrelated messages",
+			func(conn net.Conn, send func(payload string)) {
+				send("d8:msg_typei3e5:piecei0ee")
+				conn.Write(message{ID: msgUnchoke}.encode())
+			},
+			"i/o timeout",
+		},
+		{
+			"sends something that isn't bencoded",
+			func(conn net.Conn, send func(payload string)) { send("metadata, as requested") },
+			"peer sent a malformed metadata message",
+		},
+		{
+			"sends an empty message",
+			func(conn net.Conn, send func(payload string)) { send("") },
+			"peer sent a malformed metadata message",
+		},
+		{
+			"sends a list",
+			func(conn net.Conn, send func(payload string)) { send("li1ei0ee") },
+			"peer sent a malformed metadata message: not a dictionary",
+		},
+		{
+			"sends a dictionary that's cut short",
+			func(conn net.Conn, send func(payload string)) { send("d8:msg_typei1e5:piecei0e") },
+			"peer sent a malformed metadata message",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			peer := scriptedMetadataPeer(t, infoHash, tt.script)
+
+			got, err := peer.downloadMetadata(infoHash)
+			if err == nil {
+				t.Fatalf("downloadMetadata = %q, want an error containing %q", got, tt.wantErr)
+			}
+			if !strings.Contains(err.Error(), tt.wantErr) {
+				t.Errorf("downloadMetadata error = %q, want it to contain %q", err, tt.wantErr)
+			}
+		})
+	}
+}
+
+func TestParseMetadataMessage(t *testing.T) {
+	tests := []struct {
+		name    string
+		payload string
+		want    metadataMessage
+	}{
+		{
+			"data",
+			"d8:msg_typei1e5:piecei0e10:total_sizei3425eeABCDEF",
+			metadataMessage{Type: 1, Piece: 0, TotalSize: 3425, Data: []byte("ABCDEF")},
+		},
+		{
+			"data that looks like bencode",
+			"d8:msg_typei1e5:piecei2e10:total_sizei40000eed4:name1:ae",
+			metadataMessage{Type: 1, Piece: 2, TotalSize: 40000, Data: []byte("d4:name1:ae")},
+		},
+		{
+			"data message without data",
+			"d8:msg_typei1e5:piecei0e10:total_sizei10ee",
+			metadataMessage{Type: 1, Piece: 0, TotalSize: 10, Data: []byte{}},
+		},
+		{
+			"keys in another order, with extras",
+			"d10:total_sizei7e5:piecei1e5:extra3:abc8:msg_typei1eexyz",
+			metadataMessage{Type: 1, Piece: 1, TotalSize: 7, Data: []byte("xyz")},
+		},
+		{"request", "d8:msg_typei0e5:piecei4ee", metadataMessage{Type: 0, Piece: 4}},
+		{"reject", "d8:msg_typei2e5:piecei4ee", metadataMessage{Type: 2, Piece: 4}},
+		{"unknown type", "d8:msg_typei7e5:piecei0ee", metadataMessage{Type: 7, Piece: 0}},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, err := parseMetadataMessage([]byte(tt.payload))
+			if err != nil {
+				t.Fatalf("parseMetadataMessage(%q) returned error: %v", tt.payload, err)
+			}
+			if !reflect.DeepEqual(got, tt.want) {
+				t.Errorf("parseMetadataMessage(%q) = %+v, want %+v", tt.payload, got, tt.want)
 			}
 		})
 	}

@@ -75,6 +75,12 @@ func runInfo(args []string, stdout io.Writer) error {
 		return err
 	}
 
+	printTorrent(stdout, torrent)
+	return nil
+}
+
+// printTorrent prints the details of a torrent.
+func printTorrent(stdout io.Writer, torrent *Torrent) {
 	fmt.Fprintf(stdout, "Tracker URL: %s\n", torrent.Announce)
 	fmt.Fprintf(stdout, "Length: %d\n", torrent.Length)
 	fmt.Fprintf(stdout, "Info Hash: %x\n", torrent.InfoHash)
@@ -83,7 +89,6 @@ func runInfo(args []string, stdout io.Writer) error {
 	for _, hash := range torrent.PieceHashes {
 		fmt.Fprintf(stdout, "%x\n", hash)
 	}
-	return nil
 }
 
 // runPeers implements `peers <torrent file>`, which asks the torrent's
@@ -242,8 +247,9 @@ func runMagnetHandshake(args []string, stdout io.Writer) error {
 	return nil
 }
 
-// runMagnetInfo implements `magnet_info <magnet link>`, which asks a peer
-// for the metadata of the torrent that a magnet link identifies.
+// runMagnetInfo implements `magnet_info <magnet link>`, which prints details
+// about the torrent that a magnet link identifies. The details aren't in the
+// link itself: they're requested from a peer that has the torrent.
 func runMagnetInfo(args []string, stdout io.Writer) error {
 	if len(args) != 1 {
 		return errors.New("usage: magnet_info <magnet link>")
@@ -254,21 +260,13 @@ func runMagnetInfo(args []string, stdout io.Writer) error {
 		return err
 	}
 
-	peer, err := newMagnetSwarm(link).connect(context.Background(), func(peer *peerConn) error {
-		if !peer.SupportsExtensions {
-			return errors.New("peer doesn't support protocol extensions")
-		}
-		if err := peer.handshakeExtensions(); err != nil {
-			return err
-		}
-		// For now, the metadata is taken to fit in a single piece.
-		return peer.requestMetadataPiece(0)
-	})
+	torrent, peer, err := newMagnetSwarm(link).fetchTorrent(context.Background())
 	if err != nil {
 		return err
 	}
-	defer peer.Close()
+	peer.Close()
 
+	printTorrent(stdout, torrent)
 	return nil
 }
 

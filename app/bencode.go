@@ -47,6 +47,19 @@ func decodeBencodeDict(bencoded string) (dict map[string]interface{}, raw map[st
 	return dict, d.rawValues, nil
 }
 
+// decodeBencodePrefix decodes the bencoded value that the input starts with,
+// and returns it along with the rest of the input. It's for data in which a
+// bencoded value is followed by something else.
+func decodeBencodePrefix(bencoded string) (value interface{}, rest string, err error) {
+	d := bencodeDecoder{data: bencoded}
+
+	value, err = d.decodeValue()
+	if err != nil {
+		return nil, "", err
+	}
+	return value, bencoded[d.pos:], nil
+}
+
 // maxBencodeDepth caps how deeply lists and dictionaries may be nested.
 // Real-world bencoded data is only a handful of levels deep; the cap stops
 // hostile input (which can arrive from the network) from exhausting the stack.

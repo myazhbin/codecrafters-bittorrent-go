@@ -7,6 +7,7 @@ import (
 	"math/rand"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
 )
@@ -306,4 +307,66 @@ func TestLoadTorrentErrors(t *testing.T) {
 			t.Errorf("loadTorrent error = %q, want it to mention %q", err, path)
 		}
 	})
+}
+
+func TestTorrentFromMetadata(t *testing.T) {
+	content := testContent(100)
+	metadata := []byte(testInfoDict(content, 32))
+
+	torrent, err := torrentFromMetadata(metadata, "http://tracker.example/announce")
+	if err != nil {
+		t.Fatalf("torrentFromMetadata returned error: %v", err)
+	}
+
+	// The result is the same as if the metadata had come in a torrent file.
+	want, err := parseTorrent(testTorrentFile("http://tracker.example/announce", string(metadata)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(torrent, want) {
+		t.Errorf("torrentFromMetadata = %+v, want %+v", torrent, want)
+	}
+
+	if want := sha1.Sum(metadata); torrent.InfoHash != want {
+		t.Errorf("InfoHash = %x, want %x", torrent.InfoHash, want)
+	}
+	if torrent.Length != 100 || torrent.PieceLength != 32 || len(torrent.PieceHashes) != 4 {
+		t.Errorf("torrentFromMetadata = %+v, want a 100-byte file in 4 pieces of 32 bytes", torrent)
+	}
+}
+
+func TestTorrentFromMetadataErrors(t *testing.T) {
+	const hash = testPieceHash
+
+	tests := []struct {
+		name     string
+		metadata string
+		wantErr  string
+	}{
+		{"empty", "", "invalid metadata"},
+		{"not bencode", "hello", "invalid metadata"},
+		{"not a dictionary", "l6:lengthi1ee", "invalid metadata: not a dictionary"},
+		{"trailing data", minimalInfo + "junk", "trailing data"},
+		{"whole torrent file rather than its info dictionary", string(testTorrentFile("http://tracker.example/announce", minimalInfo)), `invalid metadata: missing "length"`},
+		{"missing length", "d4:name1:a12:piece lengthi1e6:pieces20:" + hash + "e", `invalid metadata: missing "length"`},
+		{"missing pieces", "d6:lengthi1e12:piece lengthi1ee", `invalid metadata: missing "pieces"`},
+		{"wrong number of piece hashes", "d6:lengthi2e12:piece lengthi1e6:pieces20:" + hash + "e", "1 piece hashes for a file of 2 bytes"},
+		{
+			"multi-file torrent",
+			"d5:filesld6:lengthi1e4:pathl1:aeee4:name1:a12:piece lengthi1e6:pieces20:" + hash + "e",
+			"multi-file torrents are not supported",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			torrent, err := torrentFromMetadata([]byte(tt.metadata), "http://tracker.example/announce")
+			if err == nil {
+				t.Fatalf("torrentFromMetadata succeeded with %+v, want an error containing %q", torrent, tt.wantErr)
+			}
+			if !strings.Contains(err.Error(), tt.wantErr) {
+				t.Errorf("torrentFromMetadata error = %q, want it to contain %q", err, tt.wantErr)
+			}
+		})
+	}
 }

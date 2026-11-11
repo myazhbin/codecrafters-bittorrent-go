@@ -90,6 +90,31 @@ func parseTorrent(data []byte) (*Torrent, error) {
 	return torrent, nil
 }
 
+// torrentFromMetadata returns the torrent that's described by the given
+// metadata, which is a torrent's bencoded info dictionary. That's what peers
+// provide when a download starts from a magnet link rather than a torrent
+// file. The tracker's URL isn't part of the metadata, and so is given
+// separately.
+func torrentFromMetadata(metadata []byte, announce string) (*Torrent, error) {
+	decoded, err := decodeBencode(string(metadata))
+	if err != nil {
+		return nil, fmt.Errorf("invalid metadata: %w", err)
+	}
+	info, ok := decoded.(map[string]interface{})
+	if !ok {
+		return nil, errors.New("invalid metadata: not a dictionary")
+	}
+
+	torrent := &Torrent{
+		Announce: announce,
+		InfoHash: sha1.Sum(metadata),
+	}
+	if err := torrent.parseInfo(info); err != nil {
+		return nil, fmt.Errorf("invalid metadata: %w", err)
+	}
+	return torrent, nil
+}
+
 // parseInfo fills in the fields that come from a torrent's info dictionary.
 func (t *Torrent) parseInfo(info map[string]interface{}) error {
 	// Multi-file torrents list their files under "files" instead of having a

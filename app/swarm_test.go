@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"crypto/sha1"
 	"errors"
 	"fmt"
 	"net/netip"
@@ -294,6 +295,80 @@ func TestSwarmConnect(t *testing.T) {
 		}
 		if !strings.Contains(err.Error(), "doesn't know of any peers") {
 			t.Errorf("connect error = %q, want it to say that the tracker has no peers", err)
+		}
+	})
+}
+
+func TestSwarmFetchTorrent(t *testing.T) {
+	content := testContent(2500)
+	info := testInfoDict(content, 1024)
+	infoHash := sha1.Sum([]byte(info))
+
+	t.Run("gets the metadata from the first peer that has it", func(t *testing.T) {
+		noExtensions := startTestPeer(t, &testPeer{InfoHash: infoHash})
+		noMetadata := startTestPeer(t, &testPeer{InfoHash: infoHash, Reserved: extensionsReserved, MetadataID: 5})
+		good := startTestPeer(t, &testPeer{InfoHash: infoHash, Reserved: extensionsReserved, MetadataID: 5, Metadata: []byte(info)})
+		spare := startTestPeer(t, &testPeer{InfoHash: infoHash, Reserved: extensionsReserved, MetadataID: 5, Metadata: []byte(info)})
+		tracker := startTestTracker(t, noExtensions.Address, noMetadata.Address, good.Address, spare.Address)
+
+		link, err := parseMagnetLink(testMagnetLink(infoHash, tracker.AnnounceURL))
+		if err != nil {
+			t.Fatal(err)
+		}
+		torrent, peer, err := newMagnetSwarm(link).fetchTorrent(context.Background())
+		if err != nil {
+			t.Fatalf("fetchTorrent returned error: %v", err)
+		}
+		defer peer.Close()
+
+		want, err := parseTorrent(testTorrentFile(tracker.AnnounceURL, info))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !reflect.DeepEqual(torrent, want) {
+			t.Errorf("fetchTorrent = %+v, want %+v", torrent, want)
+		}
+
+		// The connection that's returned is the one to the peer that provided
+		// the metadata, and it's still open.
+		if got := len(good.Handshakes); got != 1 {
+			t.Errorf("the peer with the metadata was connected to %d times, want once", got)
+		}
+		if got := len(spare.Handshakes); got != 0 {
+			t.Errorf("the peer after the one with the metadata was connected to %d times, want never", got)
+		}
+		if id, ok := peer.metadataID(); !ok || id != 5 {
+			t.Errorf("the returned connection's metadataID() = %d, %v, want 5, true", id, ok)
+		}
+		if len(good.Hangups) != 0 {
+			t.Error("the connection to the peer with the metadata was closed")
+		}
+	})
+
+	t.Run("no peer has the metadata", func(t *testing.T) {
+		noExtensions := startTestPeer(t, &testPeer{InfoHash: infoHash})
+		noMetadata := startTestPeer(t, &testPeer{InfoHash: infoHash, Reserved: extensionsReserved, MetadataID: 5})
+		tracker := startTestTracker(t, noExtensions.Address, noMetadata.Address)
+
+		link, err := parseMagnetLink(testMagnetLink(infoHash, tracker.AnnounceURL))
+		if err != nil {
+			t.Fatal(err)
+		}
+		torrent, peer, err := newMagnetSwarm(link).fetchTorrent(context.Background())
+		if err == nil {
+			peer.Close()
+			t.Fatalf("fetchTorrent = %+v, want an error", torrent)
+		}
+		if torrent != nil || peer != nil {
+			t.Errorf("fetchTorrent returned %+v and %+v alongside an error", torrent, peer)
+		}
+		for _, want := range []string{
+			"peer " + noExtensions.Address + ": peer doesn't support protocol extensions",
+			"peer " + noMetadata.Address + ": peer turned down the request for piece 0 of the metadata",
+		} {
+			if !strings.Contains(err.Error(), want) {
+				t.Errorf("fetchTorrent error = %q, want it to contain %q", err, want)
+			}
 		}
 	})
 }

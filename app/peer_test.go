@@ -124,6 +124,16 @@ type testPeer struct {
 	// at all.
 	NoExtensionHandshake bool
 
+	// Metadata is the torrent's metadata (its bencoded info dictionary),
+	// which the peer serves to clients that ask for it by way of the metadata
+	// extension. If it's nil, the peer turns such requests down.
+	Metadata []byte
+
+	// MetadataTamper, if not nil, is given the dictionary and the data of
+	// each piece of metadata that the peer is about to send, and returns what
+	// to send in their place.
+	MetadataTamper func(header map[string]interface{}, data []byte) (map[string]interface{}, []byte)
+
 	// Bitfield, if not nil, is sent instead of a bitfield that has every piece.
 	Bitfield []byte
 
@@ -249,8 +259,9 @@ func (p *testPeer) serve(conn net.Conn) {
 
 	reader := bufio.NewReader(conn)
 	choking := true
-	var pending []blockRequest // Requests that are yet to be answered
-	served := map[uint32]int{} // Number of blocks served, by piece
+	clientMetadataID := uint8(0) // The ID that the client picked for the metadata extension
+	var pending []blockRequest   // Requests that are yet to be answered
+	served := map[uint32]int{}   // Number of blocks served, by piece
 	totalServed := 0
 	for {
 		m, err := readMessage(reader)
@@ -264,9 +275,29 @@ func (p *testPeer) serve(conn net.Conn) {
 
 		switch m.ID {
 		case msgExtended:
-			if len(m.Payload) > 0 && m.Payload[0] == extensionHandshakeID {
+			if len(m.Payload) == 0 {
+				return
+			}
+			switch int(m.Payload[0]) {
+			case extensionHandshakeID:
+				// The client's handshake says which ID it wants the metadata
+				// extension's messages sent to it with.
+				if decoded, err := decodeBencode(string(m.Payload[1:])); err == nil {
+					if dict, ok := decoded.(map[string]interface{}); ok {
+						if extensions, err := dictDict(dict, "m"); err == nil {
+							id, _ := dictInt(extensions, "ut_metadata")
+							clientMetadataID = uint8(id)
+						}
+					}
+				}
 				chatter()
 				sendExtensionHandshake()
+
+			case p.MetadataID:
+				chatter()
+				if reply, ok := p.metadataReply(m.Payload[1:]); ok {
+					send(extensionMessage(clientMetadataID, reply))
+				}
 			}
 
 		case msgInterested:
@@ -340,12 +371,54 @@ func (p *testPeer) extensionHandshake() []byte {
 		extensions[name] = id
 	}
 	// Real peers send more than just their extensions.
-	return encodeBencode(map[string]interface{}{
+	handshake := map[string]interface{}{
 		"m":    extensions,
 		"p":    6881,
 		"reqq": 250,
 		"v":    "Test Peer 1.0",
-	})
+	}
+	if p.Metadata != nil {
+		handshake["metadata_size"] = len(p.Metadata)
+	}
+	return encodeBencode(handshake)
+}
+
+// metadataReply returns the payload of the peer's reply to a metadata
+// extension message from a client, if the message calls for one.
+func (p *testPeer) metadataReply(payload []byte) ([]byte, bool) {
+	decoded, err := decodeBencode(string(payload))
+	if err != nil {
+		return nil, false
+	}
+	request, ok := decoded.(map[string]interface{})
+	if !ok {
+		return nil, false
+	}
+	msgType, err := dictInt(request, "msg_type")
+	if err != nil || msgType != metadataRequest {
+		return nil, false
+	}
+	piece, err := dictInt(request, "piece")
+	if err != nil {
+		return nil, false
+	}
+
+	// A peer turns down requests for metadata that it doesn't have.
+	start := piece * metadataPieceSize
+	if piece < 0 || start >= int64(len(p.Metadata)) {
+		return encodeBencode(map[string]interface{}{"msg_type": metadataReject, "piece": piece}), true
+	}
+
+	header := map[string]interface{}{
+		"msg_type":   metadataData,
+		"piece":      piece,
+		"total_size": len(p.Metadata),
+	}
+	data := p.Metadata[start:min(start+metadataPieceSize, int64(len(p.Metadata)))]
+	if p.MetadataTamper != nil {
+		header, data = p.MetadataTamper(header, data)
+	}
+	return append(encodeBencode(header), data...), true
 }
 
 // bitfield returns the payload of the peer's bitfield message.
