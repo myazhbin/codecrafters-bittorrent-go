@@ -4,11 +4,13 @@ import (
 	"bytes"
 	"crypto/sha1"
 	"encoding/base32"
+	"encoding/binary"
 	"encoding/hex"
 	"fmt"
 	"net/url"
 	"path/filepath"
 	"reflect"
+	"sort"
 	"strings"
 	"testing"
 	"time"
@@ -821,5 +823,259 @@ func TestRunMagnetDownloadPieceErrors(t *testing.T) {
 	// for this torrent is the only one that takes asking a peer to tell.
 	if got := len(seeder.Handshakes); got != 1 {
 		t.Errorf("the peer was connected to %d times over all of the failed commands, want once", got)
+	}
+}
+
+func TestRunMagnetDownload(t *testing.T) {
+	tests := []struct {
+		name        string
+		length      int
+		pieceLength int
+	}{
+		{"several pieces with a short last one", 600_000, 65536},
+		{"file that's a multiple of the piece length", 4 * 32768, 32768},
+		{"single piece", 50_000, 262_144},
+		{"single byte", 1, 16384},
+		{"enough pieces for their hashes to overflow one piece of metadata", 100_000, 100},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			content := testContent(tt.length)
+			link, seeder := seedTestMagnet(t, content, tt.pieceLength)
+			outputPath := filepath.Join(t.TempDir(), "downloaded.bin")
+
+			stdout, err := runCommand(t, "magnet_download", "-o", outputPath, link)
+			if err != nil {
+				t.Fatalf("magnet_download returned error: %v", err)
+			}
+
+			checkFile(t, outputPath, content)
+			checkNoFile(t, outputPath+".part")
+			if want := fmt.Sprintf("Downloaded test.bin to %s.\n", outputPath); stdout != want {
+				t.Errorf("magnet_download printed %q, want %q", stdout, want)
+			}
+
+			// The connection that the metadata came over is the one that the
+			// file is then downloaded over.
+			if got := len(seeder.Handshakes); got != 1 {
+				t.Errorf("the peer was connected to %d times, want once", got)
+			}
+		})
+	}
+}
+
+// A link needn't name the download, in which case its info hash stands in.
+func TestRunMagnetDownloadWithoutName(t *testing.T) {
+	content := testContent(1000)
+	link, seeder := seedTestMagnet(t, content, 400)
+	link = strings.Replace(link, "&dn=test.bin", "", 1)
+	outputPath := filepath.Join(t.TempDir(), "downloaded.bin")
+
+	stdout, err := runCommand(t, "magnet_download", "-o", outputPath, link)
+	if err != nil {
+		t.Fatalf("magnet_download returned error: %v", err)
+	}
+	checkFile(t, outputPath, content)
+	if want := fmt.Sprintf("Downloaded %x to %s.\n", seeder.InfoHash, outputPath); stdout != want {
+		t.Errorf("magnet_download printed %q, want %q", stdout, want)
+	}
+}
+
+// A file with nothing in it still takes a peer to find that out from.
+func TestRunMagnetDownloadEmptyFile(t *testing.T) {
+	link, _ := seedTestMagnet(t, nil, 16384)
+	outputPath := filepath.Join(t.TempDir(), "empty.bin")
+
+	if _, err := runCommand(t, "magnet_download", "-o", outputPath, link); err != nil {
+		t.Fatalf("magnet_download returned error: %v", err)
+	}
+	checkFile(t, outputPath, nil)
+}
+
+// With several peers to hand, the file is downloaded from all of them, and
+// each connection is opened by the book.
+func TestRunMagnetDownloadUsesEveryPeer(t *testing.T) {
+	content := testContent(40 * 16384)
+	info := testInfoDict(content, 16384)
+	infoHash := sha1.Sum([]byte(info))
+
+	var seeders []*testPeer
+	var addresses []string
+	for range 4 {
+		seeder := startTestPeer(t, &testPeer{
+			InfoHash:    infoHash,
+			Content:     content,
+			PieceLength: 16384,
+			Reserved:    extensionsReserved,
+			MetadataID:  42,
+			Metadata:    []byte(info),
+		})
+		seeders = append(seeders, seeder)
+		addresses = append(addresses, seeder.Address)
+	}
+	tracker := startTestTracker(t, addresses...)
+	outputPath := filepath.Join(t.TempDir(), "downloaded.bin")
+
+	if _, err := runCommand(t, "magnet_download", "-o", outputPath, testMagnetLink(infoHash, tracker.AnnounceURL)); err != nil {
+		t.Fatalf("magnet_download returned error: %v", err)
+	}
+	checkFile(t, outputPath, content)
+
+	var requested []int
+	metadataRequests := 0
+	for i, seeder := range seeders {
+		if got := len(seeder.Handshakes); got != 1 {
+			t.Errorf("peer %d was connected to %d times, want once", i, got)
+		}
+		if got := (<-seeder.Handshakes).Reserved; got != extensionsReserved {
+			t.Errorf("peer %d was sent a handshake with reserved bytes % x, want % x", i, got, extensionsReserved)
+		}
+
+		messages := messagesAfterHangup(t, seeder)
+		if len(messages) == 0 || string(messages[0].encode()) != ourExtensionHandshake {
+			t.Errorf("peer %d wasn't sent an extension handshake first: %+v", i, messages)
+		}
+		pieces := 0
+		for _, m := range messages {
+			switch {
+			case m.ID == msgExtended && m.Payload[0] != extensionHandshakeID:
+				metadataRequests++
+			case m.ID == msgRequest:
+				requested = append(requested, int(binary.BigEndian.Uint32(m.Payload)))
+				pieces++
+			}
+		}
+		if pieces == 0 {
+			t.Errorf("peer %d wasn't asked for any pieces", i)
+		}
+	}
+
+	// Between them, the peers must have been asked for each piece exactly
+	// once. The metadata only needs asking for the once, too.
+	sort.Ints(requested)
+	for index := range 40 {
+		if index >= len(requested) || requested[index] != index {
+			t.Fatalf("the pieces asked for were %v, want each of 0 to 39 once", requested)
+		}
+	}
+	if metadataRequests != 1 {
+		t.Errorf("the metadata was asked for %d times, want once", metadataRequests)
+	}
+	if got := len(tracker.Requests); got != 1 {
+		t.Errorf("the tracker got %d requests, want 1", got)
+	}
+}
+
+func TestRunMagnetDownloadSurvivesBadPeers(t *testing.T) {
+	setDuration(t, &peerMessageTimeout, time.Second)
+	setDuration(t, &peerRetryDelay, 10*time.Millisecond)
+
+	content := testContent(30 * 32768)
+	info := testInfoDict(content, 32768)
+	infoHash := sha1.Sum([]byte(info))
+
+	badPeer := func(peer *testPeer) string {
+		peer.InfoHash, peer.Content, peer.PieceLength = infoHash, content, 32768
+		return startTestPeer(t, peer).Address
+	}
+	withMetadata := func(peer *testPeer) string {
+		peer.Reserved, peer.MetadataID, peer.Metadata = extensionsReserved, 7, []byte(info)
+		return badPeer(peer)
+	}
+	link, _ := seedTestMagnet(t, content, 32768,
+		stoppedServerAddress(t),
+		startTestPeer(t, &testPeer{InfoHash: [20]byte{0xaa}}).Address, // Another torrent altogether
+		badPeer(&testPeer{}),                                                                         // No extensions, but fine for pieces
+		badPeer(&testPeer{Reserved: extensionsReserved}),                                             // No metadata extension, but fine for pieces
+		badPeer(&testPeer{Reserved: extensionsReserved, MetadataID: 7}),                              // Turns down metadata requests
+		badPeer(&testPeer{Reserved: extensionsReserved, NoExtensionHandshake: true}),                 // Leaves the extension handshake unanswered
+		badPeer(&testPeer{Reserved: extensionsReserved, ExtensionHandshake: []byte("not bencoded")}), // Garbles its extension handshake
+		withMetadata(&testPeer{Tamper: zeroingTamper}),
+		withMetadata(&testPeer{NeverUnchoke: true}),
+		withMetadata(&testPeer{HangUpAfterBlocks: 1}),
+		withMetadata(&testPeer{Bitfield: make([]byte, 4)}),
+	)
+	outputPath := filepath.Join(t.TempDir(), "downloaded.bin")
+
+	if _, err := runCommand(t, "magnet_download", "-o", outputPath, link); err != nil {
+		t.Fatalf("magnet_download returned error: %v", err)
+	}
+	checkFile(t, outputPath, content)
+	checkNoFile(t, outputPath+".part")
+}
+
+func TestRunMagnetDownloadErrors(t *testing.T) {
+	setDuration(t, &peerRetryDelay, 10*time.Millisecond)
+
+	content := testContent(1000)
+	info := testInfoDict(content, 400)
+	infoHash := sha1.Sum([]byte(info))
+	link, _ := seedTestMagnet(t, content, 400)
+
+	corrupter := startTestPeer(t, &testPeer{
+		InfoHash:    infoHash,
+		Content:     content,
+		PieceLength: 400,
+		Reserved:    extensionsReserved,
+		MetadataID:  7,
+		Metadata:    []byte(info),
+		Tamper:      zeroingTamper,
+	})
+	noMetadata := startTestPeer(t, &testPeer{InfoHash: infoHash, Content: content, PieceLength: 400})
+
+	// The file that's already at the output path must survive the failures.
+	oldContents := []byte("a previous download")
+	outputPath := writeTempFile(t, "downloaded.bin", oldContents)
+
+	const usage = "usage: magnet_download -o <output file> <magnet link>"
+	tests := []struct {
+		name    string
+		args    []string
+		wantErr string
+	}{
+		{"no arguments", nil, usage},
+		{"no output file", []string{link}, usage},
+		{"no link", []string{"-o", outputPath}, usage},
+		{"too many arguments", []string{"-o", outputPath, link, "0"}, usage},
+		{"not a magnet link", []string{"-o", outputPath, sampleTorrentPath}, "invalid magnet link"},
+		{"link without a tracker", []string{"-o", outputPath, testMagnetLink(infoHash)}, "there's no tracker to ask for peers"},
+		{
+			"tracker without peers",
+			[]string{"-o", outputPath, testMagnetLink(infoHash, startTestTracker(t).AnnounceURL)},
+			"doesn't know of any peers",
+		},
+		{
+			"no peer with the metadata",
+			[]string{"-o", outputPath, testMagnetLink(infoHash, startTestTracker(t, noMetadata.Address).AnnounceURL)},
+			"peer doesn't support protocol extensions",
+		},
+		{
+			"no peer that delivers the pieces",
+			[]string{"-o", outputPath, testMagnetLink(infoHash, startTestTracker(t, corrupter.Address).AnnounceURL)},
+			"ran out of peers with 3 piece(s) left to download",
+		},
+		{
+			"output file in a directory that doesn't exist",
+			[]string{"-o", filepath.Join(t.TempDir(), "missing", "downloaded.bin"), link},
+			"no such file or directory",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			stdout, err := runCommand(t, append([]string{"magnet_download"}, tt.args...)...)
+			if err == nil {
+				t.Fatalf("magnet_download %q succeeded, want an error containing %q", tt.args, tt.wantErr)
+			}
+			if !strings.Contains(err.Error(), tt.wantErr) {
+				t.Errorf("magnet_download %q error = %q, want it to contain %q", tt.args, err, tt.wantErr)
+			}
+			if stdout != "" {
+				t.Errorf("magnet_download %q printed %q despite failing, want no output", tt.args, stdout)
+			}
+			checkFile(t, outputPath, oldContents)
+			checkNoFile(t, outputPath+".part")
+		})
 	}
 }

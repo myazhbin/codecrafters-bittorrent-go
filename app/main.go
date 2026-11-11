@@ -45,6 +45,8 @@ func run(args []string, stdout io.Writer) error {
 		return runMagnetInfo(args, stdout)
 	case "magnet_download_piece":
 		return runMagnetDownloadPiece(args, stdout)
+	case "magnet_download":
+		return runMagnetDownload(args, stdout)
 	default:
 		return fmt.Errorf("unknown command: %s", command)
 	}
@@ -318,6 +320,40 @@ func runMagnetDownloadPiece(args []string, stdout io.Writer) error {
 	}
 
 	return savePiece(peers, torrent, index, outputPath, stdout)
+}
+
+// runMagnetDownload implements `magnet_download -o <output file> <magnet link>`,
+// which downloads the file of the torrent that a magnet link identifies.
+func runMagnetDownload(args []string, stdout io.Writer) error {
+	outputPath, args, ok := parseOutputFlag(args)
+	if !ok || len(args) != 1 {
+		return errors.New("usage: magnet_download -o <output file> <magnet link>")
+	}
+
+	link, err := parseMagnetLink(args[0])
+	if err != nil {
+		return err
+	}
+
+	peers := newMagnetSwarm(link)
+	defer peers.Close()
+
+	// The link doesn't say what the torrent's pieces are, so that has to be
+	// found out from a peer first.
+	torrent, err := peers.fetchTorrent(context.Background())
+	if err != nil {
+		return err
+	}
+	if err := peers.downloadFile(torrent, outputPath); err != nil {
+		return err
+	}
+
+	name := link.Name
+	if name == "" {
+		name = fmt.Sprintf("%x", link.InfoHash) // The link doesn't give the download a name
+	}
+	fmt.Fprintf(stdout, "Downloaded %s to %s.\n", name, outputPath)
+	return nil
 }
 
 // parseOutputFlag parses the arguments of a command that takes a mandatory
