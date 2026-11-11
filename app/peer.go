@@ -225,7 +225,7 @@ type peerConn struct {
 	extensionIDs map[string]uint8
 
 	// stopWatchingContext ends the arrangement by which the connection gets
-	// closed when the context that it was dialed with is cancelled.
+	// closed when the context that it's tied to is cancelled.
 	stopWatchingContext func() bool
 }
 

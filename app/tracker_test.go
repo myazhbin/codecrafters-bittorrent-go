@@ -185,6 +185,14 @@ func TestDiscoverPeersErrors(t *testing.T) {
 		{"failure reason", http.StatusOK, "d14:failure reason15:unknown torrente", "request failed: unknown torrent"},
 		{"HTTP error", http.StatusInternalServerError, "something broke", `unexpected HTTP status "500 Internal Server Error": "something broke"`},
 		{"HTTP error with valid body", http.StatusNotFound, announceResponse(onePeer), "unexpected HTTP status"},
+		{
+			// Only the start of a long error page is quoted.
+			"HTTP error with a long body",
+			http.StatusBadGateway,
+			strings.Repeat("0123456789", 30),
+			`unexpected HTTP status "502 Bad Gateway": "` + strings.Repeat("0123456789", 20) + `"...`,
+		},
+		{"HTTP error with padded body", http.StatusForbidden, "\n  go away  \n", `unexpected HTTP status "403 Forbidden": "go away"`},
 		{"empty response", http.StatusOK, "", "invalid response"},
 		{"response is not bencode", http.StatusOK, "<html>hello</html>", "invalid response"},
 		{"response is not a dictionary", http.StatusOK, "l5:peerse", "not a dictionary"},

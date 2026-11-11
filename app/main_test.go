@@ -4,6 +4,8 @@ import (
 	"bytes"
 	"crypto/sha1"
 	"fmt"
+	"os/exec"
+	"path/filepath"
 	"strings"
 	"testing"
 )
@@ -255,4 +257,94 @@ func TestRunErrors(t *testing.T) {
 			}
 		})
 	}
+}
+
+// TestProgram builds the program and runs it the way that it's really used,
+// as a process of its own. That covers what calling run directly can't:
+// results go to standard output, errors go to standard error, and the exit
+// status tells the two apart.
+func TestProgram(t *testing.T) {
+	if testing.Short() {
+		t.Skip("building the program takes a while")
+	}
+
+	program := filepath.Join(t.TempDir(), "bittorrent")
+	if output, err := exec.Command("go", "build", "-o", program, ".").CombinedOutput(); err != nil {
+		t.Fatalf("building the program failed: %v\n%s", err, output)
+	}
+
+	content := testContent(100_000)
+	torrentPath := seedTestTorrent(t, content, 40_000)
+	magnetLink, _ := seedTestMagnet(t, content, 40_000)
+	downloadPath := filepath.Join(t.TempDir(), "downloaded.bin")
+	magnetDownloadPath := filepath.Join(t.TempDir(), "magnet-downloaded.bin")
+
+	tests := []struct {
+		name       string
+		args       []string
+		wantStdout string
+		wantStderr string // A prefix of what's expected on standard error
+		wantStatus int
+	}{
+		{"decode", []string{"decode", "d3:foo3:bar5:helloi52ee"}, `{"foo":"bar","hello":52}` + "\n", "", 0},
+		{
+			"info",
+			[]string{"info", sampleTorrentPath},
+			"Tracker URL: http://bittorrent-test-tracker.codecrafters.io/announce\n" +
+				"Length: 92063\n" +
+				"Info Hash: d69f91e6b2ae4c542468d1073a71d4ea13879a7f\n" +
+				"Piece Length: 32768\n" +
+				"Piece Hashes:\n" +
+				"e876f67a2a8886e8f36b136726c30fa29703022d\n" +
+				"6e2275e604a0766656736e81ff10b55204ad8d35\n" +
+				"f00d937a0213df1982bc8d097227ad9e909acc17\n",
+			"", 0,
+		},
+		{
+			"download",
+			[]string{"download", "-o", downloadPath, torrentPath},
+			"Downloaded " + torrentPath + " to " + downloadPath + ".\n",
+			"", 0,
+		},
+		{
+			"magnet_download",
+			[]string{"magnet_download", "-o", magnetDownloadPath, magnetLink},
+			"Downloaded test.bin to " + magnetDownloadPath + ".\n",
+			"", 0,
+		},
+		{"no command", nil, "", "error: usage: ", 1},
+		{"unknown command", []string{"frobnicate"}, "", "error: unknown command: frobnicate\n", 1},
+		{"invalid input", []string{"decode", "i52"}, "", "error: bencode: ", 1},
+		{"missing file", []string{"info", "does-not-exist.torrent"}, "", "error: open does-not-exist.torrent: ", 1},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var stdout, stderr bytes.Buffer
+			command := exec.Command(program, tt.args...)
+			command.Stdout, command.Stderr = &stdout, &stderr
+
+			status := 0
+			if err := command.Run(); err != nil {
+				exit, ok := err.(*exec.ExitError)
+				if !ok {
+					t.Fatalf("running the program failed: %v", err)
+				}
+				status = exit.ExitCode()
+			}
+
+			if status != tt.wantStatus {
+				t.Errorf("exit status = %d, want %d", status, tt.wantStatus)
+			}
+			if stdout.String() != tt.wantStdout {
+				t.Errorf("standard output = %q, want %q", stdout.String(), tt.wantStdout)
+			}
+			if !strings.HasPrefix(stderr.String(), tt.wantStderr) || (tt.wantStderr == "" && stderr.Len() != 0) {
+				t.Errorf("standard error = %q, want it to start with %q", stderr.String(), tt.wantStderr)
+			}
+		})
+	}
+
+	checkFile(t, downloadPath, content)
+	checkFile(t, magnetDownloadPath, content)
 }

@@ -81,6 +81,22 @@ func TestRunDownloadPiece(t *testing.T) {
 }
 
 // The piece replaces whatever the output file held before.
+// The piece can turn out not to be saveable only after it has been
+// downloaded.
+func TestRunDownloadPieceToUnwritablePath(t *testing.T) {
+	content := testContent(1000)
+	torrentPath := seedTestTorrent(t, content, 400)
+	outputPath := filepath.Join(t.TempDir(), "missing", "piece")
+
+	stdout, err := runCommand(t, "download_piece", "-o", outputPath, torrentPath, "0")
+	if err == nil || !strings.Contains(err.Error(), "no such file or directory") {
+		t.Errorf("download_piece error = %v, want one saying that the output file's directory doesn't exist", err)
+	}
+	if stdout != "" {
+		t.Errorf("download_piece printed %q despite failing, want no output", stdout)
+	}
+}
+
 func TestRunDownloadPieceOverwritesOutputFile(t *testing.T) {
 	content := testContent(1000)
 	torrentPath := seedTestTorrent(t, content, 400)

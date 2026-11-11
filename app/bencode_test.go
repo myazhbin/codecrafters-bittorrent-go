@@ -366,6 +366,8 @@ func TestDecodeBencodeErrors(t *testing.T) {
 		{"dictionary with a dictionary key", "ddei2ee"},
 		{"dictionary with a duplicate key", "d3:fooi1e3:fooi2ee"},
 		{"dictionary with a truncated key", "d5:fooi1ee"},
+		{"dictionary with a key that runs past the end", "d9:foo"},
+		{"dictionary with a malformed key length", "d3x:fooi1ee"},
 		{"dictionary with an invalid value", "d3:fooxe"},
 		{"dictionary with a truncated value", "d3:fooi52"},
 		{"dictionary followed by trailing data", "dee"},
