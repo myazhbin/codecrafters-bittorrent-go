@@ -217,6 +217,12 @@ type peerConn struct {
 	// us. The most significant bit of the first byte stands for piece 0.
 	bitfield []byte
 
+	// extensionIDs maps the name of each extension that the peer supports to
+	// the extension message ID that the peer wants that extension's messages
+	// sent to it with. Every peer makes its own choice of IDs. The map is nil
+	// until the peer's extension handshake arrives.
+	extensionIDs map[string]uint8
+
 	// stopWatchingContext ends the arrangement by which the connection gets
 	// closed when the context that it was dialed with is cancelled.
 	stopWatchingContext func() bool
@@ -291,7 +297,7 @@ func (p *peerConn) send(m message) error {
 
 // receive waits for the next message from the peer. Before returning the
 // message, it updates what's known about the peer accordingly: whether it's
-// choking us, and which pieces it has.
+// choking us, which pieces it has, and which extensions it supports.
 func (p *peerConn) receive() (message, error) {
 	p.conn.SetReadDeadline(time.Now().Add(peerMessageTimeout))
 	m, err := readMessage(p.reader)
@@ -311,6 +317,15 @@ func (p *peerConn) receive() (message, error) {
 			return message{}, fmt.Errorf("peer sent a malformed have message (payload of %d bytes)", len(m.Payload))
 		}
 		p.setHasPiece(int(binary.BigEndian.Uint32(m.Payload)))
+	case msgExtended:
+		if len(m.Payload) == 0 {
+			return message{}, errors.New("peer sent an extension message without an ID")
+		}
+		if m.Payload[0] == extensionHandshakeID {
+			if err := p.receiveExtensionHandshake(m.Payload[1:]); err != nil {
+				return message{}, err
+			}
+		}
 	}
 	return m, nil
 }

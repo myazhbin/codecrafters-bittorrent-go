@@ -220,14 +220,16 @@ func testMagnetLink(infoHash [20]byte, trackers ...string) string {
 
 func TestRunMagnetHandshake(t *testing.T) {
 	infoHash := exampleHandshake.InfoHash
-	peer := startTestPeer(t, &testPeer{InfoHash: infoHash, Reserved: extensionsReserved})
+	peer := startTestPeer(t, &testPeer{InfoHash: infoHash, Reserved: extensionsReserved, MetadataID: 123})
 	tracker := startTestTracker(t, peer.Address)
 
 	got, err := runCommand(t, "magnet_handshake", testMagnetLink(infoHash, tracker.AnnounceURL))
 	if err != nil {
 		t.Fatalf("magnet_handshake returned error: %v", err)
 	}
-	if want := "Peer ID: 0102030405060708090a0b0c0d0e0f1011121314\n"; got != want {
+	want := "Peer ID: 0102030405060708090a0b0c0d0e0f1011121314\n" +
+		"Peer Metadata Extension ID: 123\n"
+	if got != want {
 		t.Errorf("magnet_handshake printed %q, want %q", got, want)
 	}
 
@@ -295,6 +297,65 @@ func TestRunMagnetHandshakeWithPeerWithoutExtensions(t *testing.T) {
 				t.Errorf("the peer received %d messages after the handshake, want none: %+v", len(messages), messages)
 			}
 		})
+	}
+}
+
+// The ID that a peer uses for the metadata extension is the peer's own
+// choice, and is printed whatever it is and however the peer goes about
+// sending it.
+func TestRunMagnetHandshakePrintsMetadataExtensionID(t *testing.T) {
+	infoHash := exampleHandshake.InfoHash
+
+	tests := []struct {
+		name string
+		peer *testPeer
+		want string
+	}{
+		{"lowest ID", &testPeer{MetadataID: 1}, "Peer Metadata Extension ID: 1\n"},
+		{"highest ID", &testPeer{MetadataID: 255}, "Peer Metadata Extension ID: 255\n"},
+		{"same ID as ours", &testPeer{MetadataID: ourMetadataID}, "Peer Metadata Extension ID: 1\n"},
+		{
+			"among other extensions",
+			&testPeer{MetadataID: 42, OtherExtensions: map[string]interface{}{"ut_pex": 1, "lt_donthave": 7}},
+			"Peer Metadata Extension ID: 42\n",
+		},
+		{"sent before the bitfield", &testPeer{MetadataID: 77, EagerExtensionHandshake: true}, "Peer Metadata Extension ID: 77\n"},
+		{"sent amid other messages", &testPeer{MetadataID: 200, Chatty: true}, "Peer Metadata Extension ID: 200\n"},
+
+		// A peer can support extensions without supporting this one.
+		{"metadata extension not supported", &testPeer{OtherExtensions: map[string]interface{}{"ut_pex": 1}}, ""},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			tt.peer.InfoHash, tt.peer.Reserved = infoHash, extensionsReserved
+			peer := startTestPeer(t, tt.peer)
+			tracker := startTestTracker(t, peer.Address)
+
+			got, err := runCommand(t, "magnet_handshake", testMagnetLink(infoHash, tracker.AnnounceURL))
+			if err != nil {
+				t.Fatalf("magnet_handshake returned error: %v", err)
+			}
+			if want := "Peer ID: 0102030405060708090a0b0c0d0e0f1011121314\n" + tt.want; got != want {
+				t.Errorf("magnet_handshake printed %q, want %q", got, want)
+			}
+		})
+	}
+}
+
+func TestRunMagnetHandshakeWithoutExtensionHandshake(t *testing.T) {
+	shortenTimeout(t, &peerMessageTimeout)
+
+	infoHash := exampleHandshake.InfoHash
+	peer := startTestPeer(t, &testPeer{InfoHash: infoHash, Reserved: extensionsReserved, NoExtensionHandshake: true})
+	tracker := startTestTracker(t, peer.Address)
+
+	got, err := runCommand(t, "magnet_handshake", testMagnetLink(infoHash, tracker.AnnounceURL))
+	if err == nil || !strings.Contains(err.Error(), "i/o timeout") {
+		t.Errorf("magnet_handshake error = %v, want a timeout", err)
+	}
+	if got != "" {
+		t.Errorf("magnet_handshake printed %q despite failing, want no output", got)
 	}
 }
 

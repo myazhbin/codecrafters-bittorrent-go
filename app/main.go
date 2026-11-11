@@ -210,7 +210,8 @@ func runMagnetParse(args []string, stdout io.Writer) error {
 
 // runMagnetHandshake implements `magnet_handshake <magnet link>`, which
 // exchanges handshakes with a peer that has the torrent that a magnet link
-// identifies, and prints the peer's ID.
+// identifies. It prints the peer's ID, along with the ID that the peer uses
+// for the metadata extension, if it supports that.
 func runMagnetHandshake(args []string, stdout io.Writer) error {
 	if len(args) != 1 {
 		return errors.New("usage: magnet_handshake <magnet link>")
@@ -234,6 +235,9 @@ func runMagnetHandshake(args []string, stdout io.Writer) error {
 	}
 
 	fmt.Fprintf(stdout, "Peer ID: %x\n", peer.ID)
+	if id, ok := peer.metadataID(); ok {
+		fmt.Fprintf(stdout, "Peer Metadata Extension ID: %d\n", id)
+	}
 	return nil
 }
 

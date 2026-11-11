@@ -1,5 +1,10 @@
 package main
 
+import (
+	"errors"
+	"fmt"
+)
+
 // The extension protocol lets peers exchange messages that aren't part of the
 // base BitTorrent protocol. Each extension has a name, and every peer picks
 // for itself the numeric IDs that it wants the messages of the extensions it
@@ -32,9 +37,9 @@ func extensionMessage(id uint8, payload []byte) message {
 	return message{ID: msgExtended, Payload: append([]byte{id}, payload...)}
 }
 
-// handshakeExtensions carries out our side of the extension handshake, by
-// telling the peer which extensions we support. It must only be used with
-// peers that support the extension protocol.
+// handshakeExtensions exchanges extension handshakes with the peer, after
+// which it's known which extensions the peer supports. It must only be used
+// with peers that support the extension protocol.
 func (p *peerConn) handshakeExtensions() error {
 	// A peer follows up its handshake by announcing which pieces it has.
 	// Holding back until that has arrived keeps the conversation in the order
@@ -43,7 +48,18 @@ func (p *peerConn) handshakeExtensions() error {
 		return err
 	}
 
-	return p.sendExtensionHandshake()
+	if err := p.sendExtensionHandshake(); err != nil {
+		return err
+	}
+
+	// The peer's own extension handshake may already have arrived, or may
+	// still be to come, behind other messages.
+	for p.extensionIDs == nil {
+		if _, err := p.receive(); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // sendExtensionHandshake sends the peer our extension handshake. Its payload
@@ -56,4 +72,46 @@ func (p *peerConn) sendExtensionHandshake() error {
 		"m": map[string]interface{}{metadataExtension: ourMetadataID},
 	})
 	return p.send(extensionMessage(extensionHandshakeID, payload))
+}
+
+// receiveExtensionHandshake takes in the payload of an extension handshake
+// from the peer, which has the same format as the one that we send. Peers
+// tend to include other keys besides "m", none of which are of use here.
+//
+// A peer may send further handshakes later on to update its extensions. An
+// extension that's given an ID of 0 is one that the peer has turned off.
+func (p *peerConn) receiveExtensionHandshake(payload []byte) error {
+	decoded, err := decodeBencode(string(payload))
+	if err != nil {
+		return fmt.Errorf("peer sent a malformed extension handshake: %w", err)
+	}
+	dict, ok := decoded.(map[string]interface{})
+	if !ok {
+		return errors.New("peer sent a malformed extension handshake: not a dictionary")
+	}
+
+	if p.extensionIDs == nil {
+		p.extensionIDs = map[string]uint8{}
+	}
+	extensions, _ := dict["m"].(map[string]interface{}) // Absent if the peer supports no extensions
+	for name, value := range extensions {
+		id, isInteger := value.(int64)
+		switch {
+		case !isInteger || id < 0 || id > 255:
+			// Not a usable ID, so there's nothing to learn from this entry.
+		case id == 0:
+			delete(p.extensionIDs, name)
+		default:
+			p.extensionIDs[name] = uint8(id)
+		}
+	}
+	return nil
+}
+
+// metadataID returns the extension message ID that the peer wants the
+// metadata extension's messages sent to it with. It reports false if the
+// peer doesn't support the extension, or hasn't sent its extension handshake.
+func (p *peerConn) metadataID() (id uint8, ok bool) {
+	id, ok = p.extensionIDs[metadataExtension]
+	return id, ok
 }

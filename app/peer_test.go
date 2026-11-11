@@ -98,6 +98,32 @@ type testPeer struct {
 	// where a peer announces the protocol extensions that it supports.
 	Reserved [8]byte
 
+	// The fields in this group only matter if both the peer and the client
+	// announce support for the extension protocol. The peer then answers the
+	// client's extension handshake with one of its own.
+
+	// MetadataID is the extension message ID that the peer picks for the
+	// metadata extension. If it's zero, the peer doesn't support the
+	// extension.
+	MetadataID int
+
+	// OtherExtensions lists further extensions for the peer to claim support
+	// for in its extension handshake, with their extension message IDs.
+	OtherExtensions map[string]interface{}
+
+	// ExtensionHandshake, if not nil, is sent as the payload of the peer's
+	// extension handshake in place of the usual bencoded dictionary.
+	ExtensionHandshake []byte
+
+	// EagerExtensionHandshake makes the peer send its extension handshake
+	// straight after the base handshake, ahead of its bitfield, rather than
+	// in answer to the client's.
+	EagerExtensionHandshake bool
+
+	// NoExtensionHandshake stops the peer from sending an extension handshake
+	// at all.
+	NoExtensionHandshake bool
+
 	// Bitfield, if not nil, is sent instead of a bitfield that has every piece.
 	Bitfield []byte
 
@@ -202,7 +228,20 @@ func (p *testPeer) serve(conn net.Conn) {
 		}
 	}
 
-	out.Write(handshake{Reserved: p.Reserved, InfoHash: p.InfoHash, PeerID: testPeerID}.encode())
+	ours := handshake{Reserved: p.Reserved, InfoHash: p.InfoHash, PeerID: testPeerID}
+	sentExtensionHandshake := false
+	sendExtensionHandshake := func() {
+		usable := ours.supportsExtensions() && theirs.supportsExtensions()
+		if usable && !sentExtensionHandshake && !p.NoExtensionHandshake {
+			send(extensionMessage(extensionHandshakeID, p.extensionHandshake()))
+			sentExtensionHandshake = true
+		}
+	}
+
+	out.Write(ours.encode())
+	if p.EagerExtensionHandshake {
+		sendExtensionHandshake()
+	}
 	if !p.NoBitfield {
 		send(message{ID: msgBitfield, Payload: p.bitfield()})
 	}
@@ -224,6 +263,12 @@ func (p *testPeer) serve(conn net.Conn) {
 		}
 
 		switch m.ID {
+		case msgExtended:
+			if len(m.Payload) > 0 && m.Payload[0] == extensionHandshakeID {
+				chatter()
+				sendExtensionHandshake()
+			}
+
 		case msgInterested:
 			if !p.NeverUnchoke {
 				chatter()
@@ -279,6 +324,28 @@ func (p *testPeer) serve(conn net.Conn) {
 			}
 		}
 	}
+}
+
+// extensionHandshake returns the payload of the peer's extension handshake.
+func (p *testPeer) extensionHandshake() []byte {
+	if p.ExtensionHandshake != nil {
+		return p.ExtensionHandshake
+	}
+
+	extensions := map[string]interface{}{}
+	if p.MetadataID != 0 {
+		extensions["ut_metadata"] = p.MetadataID
+	}
+	for name, id := range p.OtherExtensions {
+		extensions[name] = id
+	}
+	// Real peers send more than just their extensions.
+	return encodeBencode(map[string]interface{}{
+		"m":    extensions,
+		"p":    6881,
+		"reqq": 250,
+		"v":    "Test Peer 1.0",
+	})
 }
 
 // bitfield returns the payload of the peer's bitfield message.
