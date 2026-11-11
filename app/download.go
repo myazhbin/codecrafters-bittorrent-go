@@ -91,9 +91,9 @@ func (s *swarm) downloadPieces(torrent *Torrent, indexes []int, save func(index 
 	for _, peer := range peers {
 		workers.Go(func() {
 			worker := pieceWorker{
+				swarm:      s,
 				torrent:    torrent,
 				address:    peer.String(),
-				greeting:   s.greeting,
 				queue:      queue,
 				downloaded: downloaded,
 			}
@@ -131,9 +131,9 @@ type downloadedPiece struct {
 
 // pieceWorker downloads pieces of a torrent from a single peer.
 type pieceWorker struct {
-	torrent  *Torrent
-	address  string    // The peer's address
-	greeting handshake // The handshake to send to the peer
+	swarm   *swarm
+	torrent *Torrent
+	address string // The peer's address
 
 	queue      chan int               // The indexes of the pieces that are waiting to be downloaded
 	downloaded chan<- downloadedPiece // Where to deliver downloaded pieces
@@ -192,7 +192,7 @@ func (w *pieceWorker) run(ctx context.Context) error {
 // connecting to the peer first if need be.
 func (w *pieceWorker) download(ctx context.Context, index int) ([]byte, error) {
 	if w.peer == nil {
-		peer, err := dialPeer(ctx, w.address, w.greeting)
+		peer, err := w.swarm.dial(ctx, w.address)
 		if err != nil {
 			return nil, err
 		}

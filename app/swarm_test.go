@@ -315,11 +315,11 @@ func TestSwarmFetchTorrent(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		torrent, peer, err := newMagnetSwarm(link).fetchTorrent(context.Background())
+		peers := newMagnetSwarm(link)
+		torrent, err := peers.fetchTorrent(context.Background())
 		if err != nil {
 			t.Fatalf("fetchTorrent returned error: %v", err)
 		}
-		defer peer.Close()
 
 		want, err := parseTorrent(testTorrentFile(tracker.AnnounceURL, info))
 		if err != nil {
@@ -329,19 +329,33 @@ func TestSwarmFetchTorrent(t *testing.T) {
 			t.Errorf("fetchTorrent = %+v, want %+v", torrent, want)
 		}
 
-		// The connection that's returned is the one to the peer that provided
-		// the metadata, and it's still open.
-		if got := len(good.Handshakes); got != 1 {
-			t.Errorf("the peer with the metadata was connected to %d times, want once", got)
-		}
 		if got := len(spare.Handshakes); got != 0 {
 			t.Errorf("the peer after the one with the metadata was connected to %d times, want never", got)
 		}
-		if id, ok := peer.metadataID(); !ok || id != 5 {
-			t.Errorf("the returned connection's metadataID() = %d, %v, want 5, true", id, ok)
-		}
+
+		// The connection to the peer that provided the metadata is kept open,
+		// and is what dialing that peer gets from then on.
 		if len(good.Hangups) != 0 {
-			t.Error("the connection to the peer with the metadata was closed")
+			t.Fatal("the connection to the peer with the metadata was closed")
+		}
+		peer, err := peers.dial(context.Background(), good.Address)
+		if err != nil {
+			t.Fatalf("dial returned error: %v", err)
+		}
+		if id, ok := peer.metadataID(); !ok || id != 5 {
+			t.Errorf("the kept connection's metadataID() = %d, %v, want 5, true", id, ok)
+		}
+		if got := len(good.Handshakes); got != 1 {
+			t.Errorf("the peer with the metadata was connected to %d times, want once", got)
+		}
+
+		// Whatever the swarm is keeping open is closed along with it.
+		peers.keep(peer)
+		peers.Close()
+		select {
+		case <-good.Hangups:
+		case <-time.After(10 * time.Second):
+			t.Error("closing the swarm left the connection that it had kept open")
 		}
 	})
 
@@ -354,13 +368,12 @@ func TestSwarmFetchTorrent(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		torrent, peer, err := newMagnetSwarm(link).fetchTorrent(context.Background())
+		torrent, err := newMagnetSwarm(link).fetchTorrent(context.Background())
 		if err == nil {
-			peer.Close()
 			t.Fatalf("fetchTorrent = %+v, want an error", torrent)
 		}
-		if torrent != nil || peer != nil {
-			t.Errorf("fetchTorrent returned %+v and %+v alongside an error", torrent, peer)
+		if torrent != nil {
+			t.Errorf("fetchTorrent returned %+v alongside an error", torrent)
 		}
 		for _, want := range []string{
 			"peer " + noExtensions.Address + ": peer doesn't support protocol extensions",
@@ -371,4 +384,201 @@ func TestSwarmFetchTorrent(t *testing.T) {
 			}
 		}
 	})
+}
+
+func TestSwarmDial(t *testing.T) {
+	infoHash := exampleHandshake.InfoHash
+	link, err := parseMagnetLink(testMagnetLink(infoHash, "http://tracker.example/announce"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	torrent := &Torrent{Announce: "http://tracker.example/announce", InfoHash: infoHash, Length: 1}
+
+	// extensionHandshakes counts the extension handshakes among the messages
+	// that a fake peer received, once the client has hung up on it.
+	extensionHandshakes := func(t *testing.T, fake *testPeer) int {
+		count := 0
+		for _, m := range messagesAfterHangup(t, fake) {
+			if m.ID == msgExtended && m.Payload[0] == extensionHandshakeID {
+				count++
+			}
+		}
+		return count
+	}
+
+	t.Run("exchanges extension handshakes when both sides support extensions", func(t *testing.T) {
+		fake := startTestPeer(t, &testPeer{InfoHash: infoHash, Reserved: extensionsReserved, MetadataID: 9})
+
+		peer, err := newMagnetSwarm(link).dial(context.Background(), fake.Address)
+		if err != nil {
+			t.Fatalf("dial returned error: %v", err)
+		}
+		if peer.Address != fake.Address {
+			t.Errorf("Address = %q, want %q", peer.Address, fake.Address)
+		}
+		if id, ok := peer.metadataID(); !ok || id != 9 {
+			t.Errorf("metadataID() = %d, %v, want 9, true", id, ok)
+		}
+		peer.Close()
+
+		if got := extensionHandshakes(t, fake); got != 1 {
+			t.Errorf("the peer was sent %d extension handshakes, want 1", got)
+		}
+	})
+
+	t.Run("leaves extensions alone when the peer doesn't support them", func(t *testing.T) {
+		fake := startTestPeer(t, &testPeer{InfoHash: infoHash})
+
+		peer, err := newMagnetSwarm(link).dial(context.Background(), fake.Address)
+		if err != nil {
+			t.Fatalf("dial returned error: %v", err)
+		}
+		peer.Close()
+
+		if got := extensionHandshakes(t, fake); got != 0 {
+			t.Errorf("the peer was sent %d extension handshakes, want none", got)
+		}
+	})
+
+	t.Run("leaves extensions alone when the download doesn't need them", func(t *testing.T) {
+		fake := startTestPeer(t, &testPeer{InfoHash: infoHash, Reserved: extensionsReserved, MetadataID: 9})
+
+		peer, err := newSwarm(torrent).dial(context.Background(), fake.Address)
+		if err != nil {
+			t.Fatalf("dial returned error: %v", err)
+		}
+		peer.Close()
+
+		if got := (<-fake.Handshakes).Reserved; got != [8]byte{} {
+			t.Errorf("the handshake was sent with reserved bytes % x, want all zeros", got)
+		}
+		if got := extensionHandshakes(t, fake); got != 0 {
+			t.Errorf("the peer was sent %d extension handshakes, want none", got)
+		}
+	})
+
+	t.Run("fails if the extension handshake does", func(t *testing.T) {
+		fake := startTestPeer(t, &testPeer{InfoHash: infoHash, Reserved: extensionsReserved, ExtensionHandshake: []byte("nonsense")})
+
+		peer, err := newMagnetSwarm(link).dial(context.Background(), fake.Address)
+		if err == nil {
+			peer.Close()
+			t.Fatal("dial succeeded, want an error")
+		}
+		if !strings.Contains(err.Error(), "malformed extension handshake") {
+			t.Errorf("dial error = %q, want it to be about the extension handshake", err)
+		}
+
+		select {
+		case <-fake.Hangups:
+		case <-time.After(10 * time.Second):
+			t.Error("the connection was left open after the extension handshake failed")
+		}
+	})
+
+	t.Run("fails if the peer can't be reached", func(t *testing.T) {
+		peer, err := newMagnetSwarm(link).dial(context.Background(), stoppedServerAddress(t))
+		if err == nil {
+			peer.Close()
+			t.Fatal("dial succeeded, want an error")
+		}
+	})
+}
+
+// A connection that the swarm has been given to keep is what dialing its peer
+// returns, in place of a new connection.
+func TestSwarmKeepsConnections(t *testing.T) {
+	infoHash := exampleHandshake.InfoHash
+	torrent := &Torrent{Announce: "http://tracker.example/announce", InfoHash: infoHash, Length: 1}
+	fake := startTestPeer(t, &testPeer{InfoHash: infoHash})
+	other := startTestPeer(t, &testPeer{InfoHash: infoHash})
+	peers := newSwarm(torrent)
+	defer peers.Close()
+
+	first, err := peers.dial(context.Background(), fake.Address)
+	if err != nil {
+		t.Fatalf("dial returned error: %v", err)
+	}
+	peers.keep(first)
+
+	// Dialing another peer has nothing to do with the kept connection.
+	elsewhere, err := peers.dial(context.Background(), other.Address)
+	if err != nil {
+		t.Fatalf("dial returned error: %v", err)
+	}
+	defer elsewhere.Close()
+	if elsewhere == first {
+		t.Fatal("dialing another peer returned the kept connection")
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	again, err := peers.dial(ctx, fake.Address)
+	if err != nil {
+		t.Fatalf("dial returned error: %v", err)
+	}
+	if again != first {
+		t.Error("dialing the peer again made a new connection, rather than returning the kept one")
+	}
+	if got := len(fake.Handshakes); got != 1 {
+		t.Errorf("the peer was connected to %d times, want once", got)
+	}
+
+	// Having been handed out, the connection is no longer the swarm's to
+	// give: the next dial makes a new one.
+	fresh, err := peers.dial(context.Background(), fake.Address)
+	if err != nil {
+		t.Fatalf("dial returned error: %v", err)
+	}
+	defer fresh.Close()
+	if fresh == first {
+		t.Error("the kept connection was handed out twice")
+	}
+
+	// The kept connection now answers to the context that it was last dialed
+	// with: cancelling that closes it.
+	if len(fake.Hangups) != 0 {
+		t.Fatal("a connection to the peer was closed early")
+	}
+	cancel()
+	select {
+	case <-fake.Hangups:
+	case <-time.After(10 * time.Second):
+		t.Error("cancelling the context didn't close the connection that was dialed with it")
+	}
+}
+
+// Keeping a second connection to a peer closes the one that was kept before.
+func TestSwarmKeepReplacesConnection(t *testing.T) {
+	infoHash := exampleHandshake.InfoHash
+	torrent := &Torrent{Announce: "http://tracker.example/announce", InfoHash: infoHash, Length: 1}
+	fake := startTestPeer(t, &testPeer{InfoHash: infoHash})
+	peers := newSwarm(torrent)
+	defer peers.Close()
+
+	first, err := dialPeer(context.Background(), fake.Address, peers.greeting)
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, err := dialPeer(context.Background(), fake.Address, peers.greeting)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	peers.keep(first)
+	peers.keep(second)
+	select {
+	case <-fake.Hangups:
+	case <-time.After(10 * time.Second):
+		t.Fatal("the connection that was kept first wasn't closed when it was replaced")
+	}
+
+	got, err := peers.dial(context.Background(), fake.Address)
+	if err != nil {
+		t.Fatalf("dial returned error: %v", err)
+	}
+	defer got.Close()
+	if got != second {
+		t.Error("dial didn't return the connection that was kept last")
+	}
 }

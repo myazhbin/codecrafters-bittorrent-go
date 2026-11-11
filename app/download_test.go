@@ -199,7 +199,7 @@ func TestRunDownloadPieceUsageErrors(t *testing.T) {
 		{"piece index that isn't a number", []string{"-o", outputPath, torrentPath, "first"}, `invalid piece index "first"`},
 		{"fractional piece index", []string{"-o", outputPath, torrentPath, "1.5"}, `invalid piece index "1.5"`},
 		{"negative piece index", []string{"-o", outputPath, torrentPath, "-1"}, `invalid piece index "-1"`},
-		{"piece index past the last piece", []string{"-o", outputPath, torrentPath, "3"}, `invalid piece index "3": the torrent has 3 pieces`},
+		{"piece index past the last piece", []string{"-o", outputPath, torrentPath, "3"}, "invalid piece index 3: the torrent has 3 pieces"},
 		{"huge piece index", []string{"-o", outputPath, torrentPath, "99999999999999999999"}, "invalid piece index"},
 	}
 

@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"net/netip"
+	"sync"
 )
 
 // unknownLeft is the number of bytes that trackers are told is left to
@@ -26,6 +27,12 @@ type swarm struct {
 	greeting handshake
 
 	peers []netip.AddrPort // The peers, once they have been asked for
+
+	// idle holds the connections that are open but not in use, by the address
+	// of their peer. A connection is kept when there's likely to be more to
+	// ask of its peer soon, which saves connecting to the peer all over again.
+	idle     map[string]*peerConn
+	idleLock sync.Mutex
 }
 
 // newSwarm returns the swarm of peers that share the given torrent.
@@ -50,6 +57,17 @@ func newMagnetSwarm(link *MagnetLink) *swarm {
 		trackers: link.Trackers,
 		left:     unknownLeft,
 		greeting: greeting,
+	}
+}
+
+// Close closes the connections to peers that the swarm has kept open.
+func (s *swarm) Close() {
+	s.idleLock.Lock()
+	defer s.idleLock.Unlock()
+
+	for address, peer := range s.idle {
+		peer.Close()
+		delete(s.idle, address)
 	}
 }
 
@@ -82,11 +100,56 @@ func (s *swarm) discover() ([]netip.AddrPort, error) {
 	return nil, errors.Join(failures...)
 }
 
+// dial returns a connection to the peer at the given address (in "host:port"
+// form) on which handshakes have been exchanged. That includes extension
+// handshakes, if both sides support the extension protocol. A connection to
+// the peer that the swarm has kept open is used in preference to a new one.
+//
+// Cancelling the context closes the connection.
+func (s *swarm) dial(ctx context.Context, address string) (*peerConn, error) {
+	s.idleLock.Lock()
+	peer := s.idle[address]
+	delete(s.idle, address)
+	s.idleLock.Unlock()
+	if peer != nil {
+		peer.bindContext(ctx)
+		return peer, nil
+	}
+
+	peer, err := dialPeer(ctx, address, s.greeting)
+	if err != nil {
+		return nil, err
+	}
+	if peer.SupportsExtensions {
+		if err := peer.handshakeExtensions(); err != nil {
+			peer.Close()
+			return nil, err
+		}
+	}
+	return peer, nil
+}
+
+// keep takes charge of a connection that's not needed for now, but whose peer
+// there's likely to be more to ask of. The next call to dial for the peer
+// returns the connection.
+func (s *swarm) keep(peer *peerConn) {
+	s.idleLock.Lock()
+	defer s.idleLock.Unlock()
+
+	if s.idle == nil {
+		s.idle = map[string]*peerConn{}
+	}
+	if previous := s.idle[peer.Address]; previous != nil {
+		previous.Close()
+	}
+	s.idle[peer.Address] = peer
+}
+
 // connect connects to one of the swarm's peers. The peers are tried in turn,
 // in the order that the tracker listed them, until one of them works out:
-// that is, it answers, completes a handshake, and then gets through whatever
-// the given function does with the connection. A peer that doesn't work out
-// is dropped in favor of the next.
+// that is, it answers, completes the handshakes, and then gets through
+// whatever the given function does with the connection. A peer that doesn't
+// work out is dropped in favor of the next.
 func (s *swarm) connect(ctx context.Context, prepare func(peer *peerConn) error) (*peerConn, error) {
 	peers, err := s.discover()
 	if err != nil {
@@ -95,7 +158,7 @@ func (s *swarm) connect(ctx context.Context, prepare func(peer *peerConn) error)
 
 	var failures []error
 	for _, address := range peers {
-		peer, err := dialPeer(ctx, address.String(), s.greeting)
+		peer, err := s.dial(ctx, address.String())
 		if err == nil {
 			if err = prepare(peer); err == nil {
 				return peer, nil
@@ -111,16 +174,13 @@ func (s *swarm) connect(ctx context.Context, prepare func(peer *peerConn) error)
 // returns the torrent that the metadata describes. It's how the details of a
 // torrent are come by when all there is to go on is a magnet link.
 //
-// The connection to the peer that provided the metadata is returned as well,
-// so that it can go on to be used for downloading from that peer.
-func (s *swarm) fetchTorrent(ctx context.Context) (*Torrent, *peerConn, error) {
+// The connection to the peer that provided the metadata is kept open, ready
+// for the torrent's data to be downloaded from the peer next.
+func (s *swarm) fetchTorrent(ctx context.Context) (*Torrent, error) {
 	var torrent *Torrent
 	peer, err := s.connect(ctx, func(peer *peerConn) error {
 		if !peer.SupportsExtensions {
 			return errors.New("peer doesn't support protocol extensions")
-		}
-		if err := peer.handshakeExtensions(); err != nil {
-			return err
 		}
 
 		metadata, err := peer.downloadMetadata(s.greeting.InfoHash)
@@ -131,7 +191,9 @@ func (s *swarm) fetchTorrent(ctx context.Context) (*Torrent, *peerConn, error) {
 		return err
 	})
 	if err != nil {
-		return nil, nil, err
+		return nil, err
 	}
-	return torrent, peer, nil
+
+	s.keep(peer)
+	return torrent, nil
 }

@@ -43,6 +43,8 @@ func run(args []string, stdout io.Writer) error {
 		return runMagnetHandshake(args, stdout)
 	case "magnet_info":
 		return runMagnetInfo(args, stdout)
+	case "magnet_download_piece":
+		return runMagnetDownloadPiece(args, stdout)
 	default:
 		return fmt.Errorf("unknown command: %s", command)
 	}
@@ -146,19 +148,37 @@ func runDownloadPiece(args []string, stdout io.Writer) error {
 		return errors.New("usage: download_piece -o <output file> <torrent file> <piece index>")
 	}
 
+	index, err := parsePieceIndex(args[1])
+	if err != nil {
+		return err
+	}
 	torrent, err := loadTorrent(args[0])
 	if err != nil {
 		return err
 	}
 
-	index, err := strconv.Atoi(args[1])
-	if err != nil || index < 0 || index >= len(torrent.PieceHashes) {
-		return fmt.Errorf("invalid piece index %q: the torrent has %d pieces, numbered from 0",
-			args[1], len(torrent.PieceHashes))
+	return savePiece(newSwarm(torrent), torrent, index, outputPath, stdout)
+}
+
+// parsePieceIndex parses the index of a piece, as given on the command line.
+func parsePieceIndex(arg string) (int, error) {
+	index, err := strconv.Atoi(arg)
+	if err != nil || index < 0 {
+		return 0, fmt.Errorf("invalid piece index %q", arg)
+	}
+	return index, nil
+}
+
+// savePiece downloads the piece of the torrent with the given index from the
+// given swarm of peers, and saves it to a file.
+func savePiece(peers *swarm, torrent *Torrent, index int, outputPath string, stdout io.Writer) error {
+	if index >= len(torrent.PieceHashes) {
+		return fmt.Errorf("invalid piece index %d: the torrent has %d pieces, numbered from 0",
+			index, len(torrent.PieceHashes))
 	}
 
 	var piece []byte
-	err = newSwarm(torrent).downloadPieces(torrent, []int{index}, func(_ int, data []byte) error {
+	err := peers.downloadPieces(torrent, []int{index}, func(_ int, data []byte) error {
 		piece = data
 		return nil
 	})
@@ -229,12 +249,8 @@ func runMagnetHandshake(args []string, stdout io.Writer) error {
 		return err
 	}
 
-	peer, err := newMagnetSwarm(link).connect(context.Background(), func(peer *peerConn) error {
-		if !peer.SupportsExtensions {
-			return nil // The base handshake is as far as things go with this peer
-		}
-		return peer.handshakeExtensions()
-	})
+	// Any peer will do, so long as the handshakes with it go through.
+	peer, err := newMagnetSwarm(link).connect(context.Background(), func(*peerConn) error { return nil })
 	if err != nil {
 		return err
 	}
@@ -260,14 +276,48 @@ func runMagnetInfo(args []string, stdout io.Writer) error {
 		return err
 	}
 
-	torrent, peer, err := newMagnetSwarm(link).fetchTorrent(context.Background())
+	peers := newMagnetSwarm(link)
+	defer peers.Close()
+
+	torrent, err := peers.fetchTorrent(context.Background())
 	if err != nil {
 		return err
 	}
-	peer.Close()
 
 	printTorrent(stdout, torrent)
 	return nil
+}
+
+// runMagnetDownloadPiece implements
+// `magnet_download_piece -o <output file> <magnet link> <piece index>`, which
+// downloads a single piece of the torrent that a magnet link identifies, and
+// saves it to a file.
+func runMagnetDownloadPiece(args []string, stdout io.Writer) error {
+	outputPath, args, ok := parseOutputFlag(args)
+	if !ok || len(args) != 2 {
+		return errors.New("usage: magnet_download_piece -o <output file> <magnet link> <piece index>")
+	}
+
+	index, err := parsePieceIndex(args[1])
+	if err != nil {
+		return err
+	}
+	link, err := parseMagnetLink(args[0])
+	if err != nil {
+		return err
+	}
+
+	peers := newMagnetSwarm(link)
+	defer peers.Close()
+
+	// The link doesn't say what the torrent's pieces are, so that has to be
+	// found out from a peer first.
+	torrent, err := peers.fetchTorrent(context.Background())
+	if err != nil {
+		return err
+	}
+
+	return savePiece(peers, torrent, index, outputPath, stdout)
 }
 
 // parseOutputFlag parses the arguments of a command that takes a mandatory

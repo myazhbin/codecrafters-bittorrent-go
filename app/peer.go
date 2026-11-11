@@ -197,7 +197,8 @@ type peerConn struct {
 	conn   net.Conn
 	reader *bufio.Reader // Buffers reads from conn
 
-	ID [20]byte // The peer's ID, as given in its handshake
+	Address string   // The address that the peer was connected to at, in "host:port" form
+	ID      [20]byte // The peer's ID, as given in its handshake
 
 	// SupportsExtensions is whether the extension protocol can be used on
 	// the connection, which takes both sides announcing support for it in
@@ -253,6 +254,7 @@ func dialPeer(ctx context.Context, address string, ours handshake) (*peerConn, e
 	return &peerConn{
 		conn:                conn,
 		reader:              bufio.NewReader(conn),
+		Address:             address,
 		ID:                  theirs.PeerID,
 		SupportsExtensions:  ours.supportsExtensions() && theirs.supportsExtensions(),
 		choked:              true,
@@ -284,6 +286,13 @@ func exchangeHandshakes(conn net.Conn, ours handshake) (handshake, error) {
 func (p *peerConn) Close() error {
 	p.stopWatchingContext()
 	return p.conn.Close()
+}
+
+// bindContext makes the connection get closed when the given context is
+// cancelled, in place of the context that it was tied to before.
+func (p *peerConn) bindContext(ctx context.Context) {
+	p.stopWatchingContext()
+	p.stopWatchingContext = context.AfterFunc(ctx, func() { p.conn.Close() })
 }
 
 // send sends a message to the peer.
