@@ -94,6 +94,10 @@ type testPeer struct {
 	Content     []byte
 	PieceLength int
 
+	// Reserved holds the reserved bytes of the peer's handshake, which is
+	// where a peer announces the protocol extensions that it supports.
+	Reserved [8]byte
+
 	// Bitfield, if not nil, is sent instead of a bitfield that has every piece.
 	Bitfield []byte
 
@@ -181,7 +185,7 @@ func (p *testPeer) serve(conn net.Conn) {
 		}
 	}
 
-	out.Write(handshake{InfoHash: p.InfoHash, PeerID: testPeerID}.encode())
+	out.Write(handshake{Reserved: p.Reserved, InfoHash: p.InfoHash, PeerID: testPeerID}.encode())
 	if !p.NoBitfield {
 		send(message{ID: msgBitfield, Payload: p.bitfield()})
 	}
@@ -363,7 +367,7 @@ func newTestTorrent(t *testing.T, content []byte, pieceLength int) *Torrent {
 func dialTestPeer(t *testing.T, peer *testPeer) *peerConn {
 	t.Helper()
 
-	conn, err := dialPeer(context.Background(), peer.Address, peer.InfoHash, newPeerID())
+	conn, err := dialPeer(context.Background(), peer.Address, handshake{InfoHash: peer.InfoHash, PeerID: newPeerID()})
 	if err != nil {
 		t.Fatalf("dialPeer returned error: %v", err)
 	}
@@ -461,7 +465,7 @@ func TestDialPeer(t *testing.T) {
 		io.Copy(io.Discard, conn)
 	})
 
-	peer, err := dialPeer(context.Background(), address, infoHash, ourID)
+	peer, err := dialPeer(context.Background(), address, handshake{InfoHash: infoHash, PeerID: ourID})
 	if err != nil {
 		t.Fatalf("dialPeer returned error: %v", err)
 	}
@@ -518,7 +522,7 @@ func TestDialPeerErrors(t *testing.T) {
 		{
 			"peer hangs up as soon as it's connected to",
 			startTestServer(t, func(conn net.Conn) {}),
-			"handshake with peer",
+			"handshake",
 		},
 		{
 			"peer hangs up in the middle of its handshake",
@@ -550,7 +554,7 @@ func TestDialPeerErrors(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			peer, err := dialPeer(context.Background(), tt.address, infoHash, newPeerID())
+			peer, err := dialPeer(context.Background(), tt.address, handshake{InfoHash: infoHash, PeerID: newPeerID()})
 			if err == nil {
 				peer.Close()
 				t.Fatalf("dialPeer succeeded, want an error containing %q", tt.wantErr)
@@ -570,7 +574,7 @@ func TestDialPeerHandshakeTimeout(t *testing.T) {
 	address := startTestServer(t, func(conn net.Conn) { io.Copy(io.Discard, conn) })
 
 	start := time.Now()
-	_, err := dialPeer(context.Background(), address, [20]byte{}, newPeerID())
+	_, err := dialPeer(context.Background(), address, handshake{InfoHash: [20]byte{}, PeerID: newPeerID()})
 	elapsed := time.Since(start)
 
 	if !errors.Is(err, os.ErrDeadlineExceeded) {
@@ -598,7 +602,7 @@ func TestDialPeerClearsHandshakeDeadline(t *testing.T) {
 		io.Copy(io.Discard, conn)
 	})
 
-	peer, err := dialPeer(context.Background(), address, infoHash, newPeerID())
+	peer, err := dialPeer(context.Background(), address, handshake{InfoHash: infoHash, PeerID: newPeerID()})
 	if err != nil {
 		t.Fatalf("dialPeer returned error: %v", err)
 	}
@@ -613,6 +617,98 @@ func TestDialPeerClearsHandshakeDeadline(t *testing.T) {
 	}
 }
 
+func TestHandshakeAnnounceExtensions(t *testing.T) {
+	h := handshake{InfoHash: exampleHandshake.InfoHash, PeerID: exampleHandshake.PeerID}
+	if h.supportsExtensions() {
+		t.Error("a handshake with no reserved bits set claims to support extensions")
+	}
+
+	h.announceExtensions()
+	if !h.supportsExtensions() {
+		t.Error("the handshake doesn't claim to support extensions after announceExtensions")
+	}
+
+	// The 20th bit from the right, counting from 0, and no other.
+	if want := [8]byte{0x00, 0x00, 0x00, 0x00, 0x00, 0x10, 0x00, 0x00}; h.Reserved != want {
+		t.Errorf("reserved bytes = % x, want % x", h.Reserved, want)
+	}
+	if got, want := string(h.encode()[20:28]), "\x00\x00\x00\x00\x00\x10\x00\x00"; got != want {
+		t.Errorf("encoded reserved bytes = %q, want %q", got, want)
+	}
+
+	// Bits that are already set are left alone.
+	h.Reserved = [8]byte{0x80, 0, 0, 0, 0, 0x01, 0, 0x05}
+	h.announceExtensions()
+	if want := [8]byte{0x80, 0, 0, 0, 0, 0x11, 0, 0x05}; h.Reserved != want {
+		t.Errorf("reserved bytes = % x, want % x", h.Reserved, want)
+	}
+}
+
+func TestHandshakeSupportsExtensions(t *testing.T) {
+	tests := []struct {
+		reserved [8]byte
+		want     bool
+	}{
+		{[8]byte{}, false},
+		{[8]byte{0, 0, 0, 0, 0, 0x10, 0, 0}, true},
+		{[8]byte{0, 0, 0, 0, 0, 0x10, 0, 0x05}, true}, // As sent by clients that also support DHT and fast peers
+		{[8]byte{0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff}, true},
+		{[8]byte{0xff, 0xff, 0xff, 0xff, 0xff, 0xef, 0xff, 0xff}, false},
+		{[8]byte{0, 0, 0, 0, 0, 0x20, 0, 0}, false},
+		{[8]byte{0, 0, 0, 0, 0, 0x08, 0, 0}, false},
+		{[8]byte{0, 0, 0, 0, 0x10, 0, 0, 0}, false},
+		{[8]byte{0, 0, 0, 0, 0, 0, 0x10, 0}, false},
+		{[8]byte{0, 0, 0x10, 0, 0, 0, 0, 0}, false}, // The 20th bit from the left
+	}
+
+	for _, tt := range tests {
+		if got := (handshake{Reserved: tt.reserved}).supportsExtensions(); got != tt.want {
+			t.Errorf("supportsExtensions() with reserved bytes % x = %v, want %v", tt.reserved, got, tt.want)
+		}
+	}
+}
+
+// The extension protocol can only be used if both sides announce support for
+// it.
+func TestDialPeerExtensionSupport(t *testing.T) {
+	infoHash := exampleHandshake.InfoHash
+	extensions := [8]byte{0, 0, 0, 0, 0, 0x10, 0, 0}
+
+	tests := []struct {
+		name   string
+		ours   [8]byte
+		theirs [8]byte
+		want   bool
+	}{
+		{"neither side", [8]byte{}, [8]byte{}, false},
+		{"only us", extensions, [8]byte{}, false},
+		{"only the peer", [8]byte{}, extensions, false},
+		{"both sides", extensions, extensions, true},
+		{"both sides, among other things", extensions, [8]byte{0, 0, 0, 0, 0, 0x18, 0, 0x05}, true},
+		{"peer announces something else", extensions, [8]byte{0, 0, 0, 0, 0, 0, 0, 0x05}, false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			fake := startTestPeer(t, &testPeer{InfoHash: infoHash, Reserved: tt.theirs})
+
+			peer, err := dialPeer(context.Background(), fake.Address,
+				handshake{Reserved: tt.ours, InfoHash: infoHash, PeerID: newPeerID()})
+			if err != nil {
+				t.Fatalf("dialPeer returned error: %v", err)
+			}
+			defer peer.Close()
+
+			if peer.SupportsExtensions != tt.want {
+				t.Errorf("SupportsExtensions = %v, want %v", peer.SupportsExtensions, tt.want)
+			}
+			if got := (<-fake.Handshakes).Reserved; got != tt.ours {
+				t.Errorf("the peer was sent the reserved bytes % x, want % x", got, tt.ours)
+			}
+		})
+	}
+}
+
 func TestDialPeerWithCancelledContext(t *testing.T) {
 	infoHash := exampleHandshake.InfoHash
 	fake := startTestPeer(t, &testPeer{InfoHash: infoHash})
@@ -620,7 +716,7 @@ func TestDialPeerWithCancelledContext(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
 
-	peer, err := dialPeer(ctx, fake.Address, infoHash, newPeerID())
+	peer, err := dialPeer(ctx, fake.Address, handshake{InfoHash: infoHash, PeerID: newPeerID()})
 	if err == nil {
 		peer.Close()
 		t.Fatal("dialPeer succeeded, want an error")
@@ -644,7 +740,7 @@ func TestCancellingContextInterruptsPeer(t *testing.T) {
 		time.AfterFunc(50*time.Millisecond, cancel)
 
 		start := time.Now()
-		peer, err := dialPeer(ctx, silent, torrent.InfoHash, newPeerID())
+		peer, err := dialPeer(ctx, silent, handshake{InfoHash: torrent.InfoHash, PeerID: newPeerID()})
 		if err == nil {
 			peer.Close()
 			t.Fatal("dialPeer succeeded, want an error")
@@ -664,7 +760,7 @@ func TestCancellingContextInterruptsPeer(t *testing.T) {
 
 		ctx, cancel := context.WithCancel(context.Background())
 		defer cancel()
-		peer, err := dialPeer(ctx, choker.Address, torrent.InfoHash, newPeerID())
+		peer, err := dialPeer(ctx, choker.Address, handshake{InfoHash: torrent.InfoHash, PeerID: newPeerID()})
 		if err != nil {
 			t.Fatalf("dialPeer returned error: %v", err)
 		}
@@ -688,7 +784,7 @@ func TestClosedPeerIgnoresContext(t *testing.T) {
 	fake := startTestPeer(t, &testPeer{InfoHash: infoHash})
 
 	ctx, cancel := context.WithCancel(context.Background())
-	peer, err := dialPeer(ctx, fake.Address, infoHash, newPeerID())
+	peer, err := dialPeer(ctx, fake.Address, handshake{InfoHash: infoHash, PeerID: newPeerID()})
 	if err != nil {
 		t.Fatalf("dialPeer returned error: %v", err)
 	}
@@ -707,7 +803,7 @@ func TestTestPeerRecordsHandshakes(t *testing.T) {
 	ourID := newPeerID()
 	fake := startTestPeer(t, &testPeer{InfoHash: infoHash})
 
-	peer, err := dialPeer(context.Background(), fake.Address, infoHash, ourID)
+	peer, err := dialPeer(context.Background(), fake.Address, handshake{InfoHash: infoHash, PeerID: ourID})
 	if err != nil {
 		t.Fatalf("dialPeer returned error: %v", err)
 	}
@@ -1351,7 +1447,7 @@ func TestDownloadPieceFromUncooperativePeer(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			peer, err := dialPeer(context.Background(), tt.address, torrent.InfoHash, newPeerID())
+			peer, err := dialPeer(context.Background(), tt.address, handshake{InfoHash: torrent.InfoHash, PeerID: newPeerID()})
 			if err != nil {
 				t.Fatalf("dialPeer returned error: %v", err)
 			}
@@ -1392,7 +1488,7 @@ func TestDownloadPieceToleratesDuplicateBlocks(t *testing.T) {
 		io.Copy(io.Discard, conn)
 	})
 
-	peer, err := dialPeer(context.Background(), address, torrent.InfoHash, newPeerID())
+	peer, err := dialPeer(context.Background(), address, handshake{InfoHash: torrent.InfoHash, PeerID: newPeerID()})
 	if err != nil {
 		t.Fatalf("dialPeer returned error: %v", err)
 	}

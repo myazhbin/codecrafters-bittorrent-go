@@ -279,6 +279,28 @@ func TestRunDownloadOverwritesOutputFile(t *testing.T) {
 	checkFile(t, outputPath, content)
 }
 
+// Downloads that start from a torrent file don't need protocol extensions, and
+// don't announce support for any.
+func TestRunDownloadDoesNotAnnounceExtensions(t *testing.T) {
+	content := testContent(1000)
+	info := testInfoDict(content, 400)
+	seeder := startTestPeer(t, &testPeer{
+		InfoHash:    sha1.Sum([]byte(info)),
+		Content:     content,
+		PieceLength: 400,
+		Reserved:    extensionsReserved,
+	})
+	tracker := startTestTracker(t, seeder.Address)
+	torrentPath := writeTempFile(t, "test.torrent", testTorrentFile(tracker.AnnounceURL, info))
+
+	if _, err := runCommand(t, "download", "-o", filepath.Join(t.TempDir(), "downloaded.bin"), torrentPath); err != nil {
+		t.Fatalf("download returned error: %v", err)
+	}
+	if got := (<-seeder.Handshakes).Reserved; got != [8]byte{} {
+		t.Errorf("the handshake was sent with reserved bytes % x, want all zeros", got)
+	}
+}
+
 // With several peers to hand, pieces are downloaded from all of them.
 func TestRunDownloadUsesEveryPeer(t *testing.T) {
 	content := testContent(40 * 16384)
@@ -522,7 +544,7 @@ func TestDownloadPiecesSavesPiecesOneAtATime(t *testing.T) {
 
 	var saving atomic.Int32
 	saved := map[int]int{}
-	err = downloadPieces(torrent, indexes, func(index int, piece []byte) error {
+	err = newSwarm(torrent).downloadPieces(torrent, indexes, func(index int, piece []byte) error {
 		if saving.Add(1) != 1 {
 			t.Error("save was called while another call was in progress")
 		}
@@ -567,7 +589,7 @@ func TestDownloadPiecesStopsWhenSavingFails(t *testing.T) {
 
 	diskFull := errors.New("disk full")
 	calls := 0
-	err = downloadPieces(torrent, indexes, func(index int, piece []byte) error {
+	err = newSwarm(torrent).downloadPieces(torrent, indexes, func(index int, piece []byte) error {
 		calls++
 		if calls == 3 {
 			return diskFull
@@ -590,7 +612,7 @@ func TestDownloadPiecesWithNothingToDownload(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	err = downloadPieces(torrent, nil, func(index int, piece []byte) error {
+	err = newSwarm(torrent).downloadPieces(torrent, nil, func(index int, piece []byte) error {
 		t.Errorf("save was called with piece %d", index)
 		return nil
 	})

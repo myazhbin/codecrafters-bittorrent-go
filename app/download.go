@@ -18,11 +18,12 @@ const maxPeerFailures = 3
 // shorten it.
 var peerRetryDelay = time.Second
 
-// downloadFile downloads the torrent's file and saves it at path.
+// downloadFile downloads the torrent's file from the swarm's peers, and saves
+// it at path.
 //
 // The file only appears at path once it's complete. Until then, its data is
 // kept in a temporary file alongside, which is removed if the download fails.
-func downloadFile(torrent *Torrent, path string) error {
+func (s *swarm) downloadFile(torrent *Torrent, path string) error {
 	partPath := path + ".part"
 	file, err := os.Create(partPath)
 	if err != nil {
@@ -35,7 +36,7 @@ func downloadFile(torrent *Torrent, path string) error {
 	}
 	// Pieces arrive in no particular order, so each one is written at its
 	// own offset in the file as it comes in.
-	err = downloadPieces(torrent, indexes, func(index int, piece []byte) error {
+	err = s.downloadPieces(torrent, indexes, func(index int, piece []byte) error {
 		_, err := file.WriteAt(piece, int64(index)*torrent.PieceLength)
 		return err
 	})
@@ -54,28 +55,21 @@ func downloadFile(torrent *Torrent, path string) error {
 }
 
 // downloadPieces downloads the pieces of the torrent with the given indexes
-// from the torrent's peers, which it asks the tracker for. It calls save with
-// each piece once the piece has been downloaded and verified against its
-// hash. The calls are made one at a time, in whichever order the pieces
-// happen to complete.
+// from the swarm's peers. It calls save with each piece once the piece has
+// been downloaded and verified against its hash. The calls are made one at a
+// time, in whichever order the pieces happen to complete.
 //
 // Pieces are downloaded from every peer at once: each peer has a worker that
 // takes pieces off a shared queue. A piece that a worker fails to download,
 // for whatever reason, goes back on the queue for any worker to try again.
-func downloadPieces(torrent *Torrent, indexes []int, save func(index int, piece []byte) error) error {
+func (s *swarm) downloadPieces(torrent *Torrent, indexes []int, save func(index int, piece []byte) error) error {
 	if len(indexes) == 0 {
 		return nil
 	}
 
-	peerID := newPeerID()
-
-	// Nothing has been downloaded yet, so the whole file is left.
-	peers, err := discoverPeers(torrent.Announce, torrent.InfoHash, peerID, torrent.Length)
+	peers, err := s.discover()
 	if err != nil {
 		return err
-	}
-	if len(peers) == 0 {
-		return errors.New("the tracker doesn't know of any peers for this torrent")
 	}
 
 	// Returning cancels the context, which stops the workers, and then waits
@@ -99,7 +93,7 @@ func downloadPieces(torrent *Torrent, indexes []int, save func(index int, piece 
 			worker := pieceWorker{
 				torrent:    torrent,
 				address:    peer.String(),
-				peerID:     peerID,
+				greeting:   s.greeting,
 				queue:      queue,
 				downloaded: downloaded,
 			}
@@ -137,9 +131,9 @@ type downloadedPiece struct {
 
 // pieceWorker downloads pieces of a torrent from a single peer.
 type pieceWorker struct {
-	torrent *Torrent
-	address string   // The peer's address
-	peerID  [20]byte // Our own peer ID
+	torrent  *Torrent
+	address  string    // The peer's address
+	greeting handshake // The handshake to send to the peer
 
 	queue      chan int               // The indexes of the pieces that are waiting to be downloaded
 	downloaded chan<- downloadedPiece // Where to deliver downloaded pieces
@@ -198,7 +192,7 @@ func (w *pieceWorker) run(ctx context.Context) error {
 // connecting to the peer first if need be.
 func (w *pieceWorker) download(ctx context.Context, index int) ([]byte, error) {
 	if w.peer == nil {
-		peer, err := dialPeer(ctx, w.address, w.torrent.InfoHash, w.peerID)
+		peer, err := dialPeer(ctx, w.address, w.greeting)
 		if err != nil {
 			return nil, err
 		}

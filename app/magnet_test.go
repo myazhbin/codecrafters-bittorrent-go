@@ -3,6 +3,8 @@ package main
 import (
 	"encoding/base32"
 	"encoding/hex"
+	"fmt"
+	"net/url"
 	"reflect"
 	"strings"
 	"testing"
@@ -201,6 +203,127 @@ func TestRunMagnetParseErrors(t *testing.T) {
 			}
 			if got != "" {
 				t.Errorf("magnet_parse %q printed %q despite failing, want no output", tt.args, got)
+			}
+		})
+	}
+}
+
+// testMagnetLink returns a magnet link for the torrent with the given info
+// hash and trackers.
+func testMagnetLink(infoHash [20]byte, trackers ...string) string {
+	link := fmt.Sprintf("magnet:?xt=urn:btih:%x&dn=test.bin", infoHash)
+	for _, tracker := range trackers {
+		link += "&tr=" + url.QueryEscape(tracker)
+	}
+	return link
+}
+
+func TestRunMagnetHandshake(t *testing.T) {
+	infoHash := exampleHandshake.InfoHash
+	peer := startTestPeer(t, &testPeer{InfoHash: infoHash, Reserved: extensionsReserved})
+	tracker := startTestTracker(t, peer.Address)
+
+	got, err := runCommand(t, "magnet_handshake", testMagnetLink(infoHash, tracker.AnnounceURL))
+	if err != nil {
+		t.Fatalf("magnet_handshake returned error: %v", err)
+	}
+	if want := "Peer ID: 0102030405060708090a0b0c0d0e0f1011121314\n"; got != want {
+		t.Errorf("magnet_handshake printed %q, want %q", got, want)
+	}
+
+	// The handshake must have been for the torrent that the link identifies,
+	// and must have announced support for extensions by setting the 20th
+	// reserved bit from the right, and no other.
+	ours := <-peer.Handshakes
+	if ours.InfoHash != infoHash {
+		t.Errorf("the handshake was sent with info hash %x, want %x", ours.InfoHash, infoHash)
+	}
+	if want := [8]byte{0x00, 0x00, 0x00, 0x00, 0x00, 0x10, 0x00, 0x00}; ours.Reserved != want {
+		t.Errorf("the handshake was sent with reserved bytes % x, want % x", ours.Reserved, want)
+	}
+
+	// The peer must have been found by asking the link's tracker about the
+	// torrent, as a client that still has data left to download.
+	query := (<-tracker.Requests).URL.Query()
+	if got := query.Get("info_hash"); got != string(infoHash[:]) {
+		t.Errorf("the tracker was asked about info hash %x, want %x", got, infoHash)
+	}
+	if got := query.Get("peer_id"); got != string(ours.PeerID[:]) {
+		t.Errorf("the tracker was given the peer ID %q, but the peer was given %q", got, ours.PeerID)
+	}
+	if got := query.Get("left"); got == "" || got == "0" {
+		t.Errorf("the tracker was told that %q bytes are left, want a positive number", got)
+	}
+	if got := query.Get("compact"); got != "1" {
+		t.Errorf("compact = %q, want %q", got, "1")
+	}
+}
+
+// A peer that doesn't support extensions can still be shaken hands with.
+func TestRunMagnetHandshakeWithPeerWithoutExtensions(t *testing.T) {
+	infoHash := exampleHandshake.InfoHash
+	peer := startTestPeer(t, &testPeer{InfoHash: infoHash})
+	tracker := startTestTracker(t, peer.Address)
+
+	got, err := runCommand(t, "magnet_handshake", testMagnetLink(infoHash, tracker.AnnounceURL))
+	if err != nil {
+		t.Fatalf("magnet_handshake returned error: %v", err)
+	}
+	if want := "Peer ID: 0102030405060708090a0b0c0d0e0f1011121314\n"; got != want {
+		t.Errorf("magnet_handshake printed %q, want %q", got, want)
+	}
+}
+
+func TestRunMagnetHandshakeSkipsUselessPeersAndTrackers(t *testing.T) {
+	infoHash := exampleHandshake.InfoHash
+	otherTorrent := startTestPeer(t, &testPeer{InfoHash: [20]byte{0xaa}})
+	peer := startTestPeer(t, &testPeer{InfoHash: infoHash, Reserved: extensionsReserved})
+	tracker := startTestTracker(t, stoppedServerAddress(t), otherTorrent.Address, peer.Address)
+	deadTracker := "http://" + stoppedServerAddress(t) + "/announce"
+
+	got, err := runCommand(t, "magnet_handshake", testMagnetLink(infoHash, deadTracker, tracker.AnnounceURL))
+	if err != nil {
+		t.Fatalf("magnet_handshake returned error: %v", err)
+	}
+	if want := "Peer ID: 0102030405060708090a0b0c0d0e0f1011121314\n"; got != want {
+		t.Errorf("magnet_handshake printed %q, want %q", got, want)
+	}
+	if got := len(peer.Handshakes); got != 1 {
+		t.Errorf("the peer was connected to %d times, want once", got)
+	}
+}
+
+func TestRunMagnetHandshakeErrors(t *testing.T) {
+	infoHash := exampleHandshake.InfoHash
+	emptyTracker := startTestTracker(t)
+	otherTorrent := startTestPeer(t, &testPeer{InfoHash: [20]byte{0xaa}})
+	uselessTracker := startTestTracker(t, otherTorrent.Address)
+
+	tests := []struct {
+		name    string
+		args    []string
+		wantErr string
+	}{
+		{"no link", nil, "usage: magnet_handshake"},
+		{"too many arguments", []string{exampleMagnetLink, "extra"}, "usage: magnet_handshake"},
+		{"not a magnet link", []string{sampleTorrentPath}, "invalid magnet link"},
+		{"link without a tracker", []string{testMagnetLink(infoHash)}, "there's no tracker to ask for peers"},
+		{"tracker that can't be reached", []string{testMagnetLink(infoHash, "http://"+stoppedServerAddress(t)+"/announce")}, "tracker: "},
+		{"tracker without peers", []string{testMagnetLink(infoHash, emptyTracker.AnnounceURL)}, "doesn't know of any peers"},
+		{"no peer with the torrent", []string{testMagnetLink(infoHash, uselessTracker.AnnounceURL)}, "peer answered for a different torrent"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, err := runCommand(t, append([]string{"magnet_handshake"}, tt.args...)...)
+			if err == nil {
+				t.Fatalf("magnet_handshake %q succeeded, want an error containing %q", tt.args, tt.wantErr)
+			}
+			if !strings.Contains(err.Error(), tt.wantErr) {
+				t.Errorf("magnet_handshake %q error = %q, want it to contain %q", tt.args, err, tt.wantErr)
+			}
+			if got != "" {
+				t.Errorf("magnet_handshake %q printed %q despite failing, want no output", tt.args, got)
 			}
 		})
 	}

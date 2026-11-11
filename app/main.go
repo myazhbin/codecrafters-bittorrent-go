@@ -39,6 +39,8 @@ func run(args []string, stdout io.Writer) error {
 		return runDownload(args, stdout)
 	case "magnet_parse":
 		return runMagnetParse(args, stdout)
+	case "magnet_handshake":
+		return runMagnetHandshake(args, stdout)
 	default:
 		return fmt.Errorf("unknown command: %s", command)
 	}
@@ -118,9 +120,9 @@ func runHandshake(args []string, stdout io.Writer) error {
 		return err
 	}
 
-	peer, err := dialPeer(context.Background(), args[1], torrent.InfoHash, newPeerID())
+	peer, err := dialPeer(context.Background(), args[1], handshake{InfoHash: torrent.InfoHash, PeerID: newPeerID()})
 	if err != nil {
-		return err
+		return fmt.Errorf("peer %s: %w", args[1], err)
 	}
 	defer peer.Close()
 
@@ -149,7 +151,7 @@ func runDownloadPiece(args []string, stdout io.Writer) error {
 	}
 
 	var piece []byte
-	err = downloadPieces(torrent, []int{index}, func(_ int, data []byte) error {
+	err = newSwarm(torrent).downloadPieces(torrent, []int{index}, func(_ int, data []byte) error {
 		piece = data
 		return nil
 	})
@@ -177,7 +179,7 @@ func runDownload(args []string, stdout io.Writer) error {
 		return err
 	}
 
-	if err := downloadFile(torrent, outputPath); err != nil {
+	if err := newSwarm(torrent).downloadFile(torrent, outputPath); err != nil {
 		return err
 	}
 
@@ -203,6 +205,29 @@ func runMagnetParse(args []string, stdout io.Writer) error {
 	}
 	fmt.Fprintf(stdout, "Tracker URL: %s\n", tracker)
 	fmt.Fprintf(stdout, "Info Hash: %x\n", link.InfoHash)
+	return nil
+}
+
+// runMagnetHandshake implements `magnet_handshake <magnet link>`, which
+// exchanges handshakes with a peer that has the torrent that a magnet link
+// identifies, and prints the peer's ID.
+func runMagnetHandshake(args []string, stdout io.Writer) error {
+	if len(args) != 1 {
+		return errors.New("usage: magnet_handshake <magnet link>")
+	}
+
+	link, err := parseMagnetLink(args[0])
+	if err != nil {
+		return err
+	}
+
+	peer, err := newMagnetSwarm(link).connect(context.Background())
+	if err != nil {
+		return err
+	}
+	defer peer.Close()
+
+	fmt.Fprintf(stdout, "Peer ID: %x\n", peer.ID)
 	return nil
 }
 

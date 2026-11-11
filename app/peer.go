@@ -60,6 +60,29 @@ type handshake struct {
 	PeerID   [20]byte // Identifies the peer that sent the handshake
 }
 
+// Support for the extension protocol, which lets peers exchange messages that
+// aren't part of the base protocol, is announced by setting the 20th bit from
+// the right of the handshake's reserved bytes (counting from 0). That bit is
+// in the sixth of the eight bytes:
+//
+//	00 00 00 00 00 10 00 00
+const (
+	extensionsReservedByte = 5
+	extensionsReservedBit  = 0x10
+)
+
+// announceExtensions marks the handshake's sender as supporting the extension
+// protocol.
+func (h *handshake) announceExtensions() {
+	h.Reserved[extensionsReservedByte] |= extensionsReservedBit
+}
+
+// supportsExtensions reports whether the handshake's sender supports the
+// extension protocol.
+func (h handshake) supportsExtensions() bool {
+	return h.Reserved[extensionsReservedByte]&extensionsReservedBit != 0
+}
+
 // encode returns the handshake as it's sent over the wire:
 //
 //	 1 byte   length of the protocol name (19)
@@ -174,6 +197,11 @@ type peerConn struct {
 
 	ID [20]byte // The peer's ID, as given in its handshake
 
+	// SupportsExtensions is whether the extension protocol can be used on
+	// the connection, which takes both sides announcing support for it in
+	// their handshakes.
+	SupportsExtensions bool
+
 	// choked is whether the peer is refusing to serve our requests. Peers
 	// start out choking, and unchoke those that tell them they're interested
 	// as and when they see fit.
@@ -193,13 +221,13 @@ type peerConn struct {
 }
 
 // dialPeer connects to the peer at address (in "host:port" form) and
-// exchanges handshakes with it for the torrent identified by infoHash. peerID
-// is the ID that this client identifies itself with.
+// exchanges handshakes with it. ours is the handshake to send: it says which
+// torrent the connection is for, and who this client is.
 //
 // Cancelling the context closes the connection, even after dialPeer has
 // returned. This makes anything that's blocked on the connection fail
 // promptly, rather than when its timeout runs out.
-func dialPeer(ctx context.Context, address string, infoHash, peerID [20]byte) (*peerConn, error) {
+func dialPeer(ctx context.Context, address string, ours handshake) (*peerConn, error) {
 	dialer := net.Dialer{Timeout: peerDialTimeout}
 	conn, err := dialer.DialContext(ctx, "tcp", address)
 	if err != nil {
@@ -207,17 +235,18 @@ func dialPeer(ctx context.Context, address string, infoHash, peerID [20]byte) (*
 	}
 	stopWatchingContext := context.AfterFunc(ctx, func() { conn.Close() })
 
-	theirs, err := exchangeHandshakes(conn, handshake{InfoHash: infoHash, PeerID: peerID})
+	theirs, err := exchangeHandshakes(conn, ours)
 	if err != nil {
 		stopWatchingContext()
 		conn.Close()
-		return nil, fmt.Errorf("handshake with peer %s: %w", address, err)
+		return nil, err
 	}
 
 	return &peerConn{
 		conn:                conn,
 		reader:              bufio.NewReader(conn),
 		ID:                  theirs.PeerID,
+		SupportsExtensions:  ours.supportsExtensions() && theirs.supportsExtensions(),
 		choked:              true,
 		stopWatchingContext: stopWatchingContext,
 	}, nil
